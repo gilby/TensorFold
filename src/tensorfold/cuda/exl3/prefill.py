@@ -92,6 +92,7 @@ FOLD_TILES = {
 FOLD = os.environ.get("TENSORFOLD_EXL3_FOLD", "1") != "0"            # 0: every family on the W_q path
 FOLD_BF16 = os.environ.get("TENSORFOLD_EXL3_FOLD_BF16", "1") != "0"  # 0: fp16 W'' (and fp16 rows in the GEMM)
 FOLD2 = os.environ.get("TENSORFOLD_EXL3_FOLD2", "1") != "0"          # 0: unpack_fold, the same bits, slower
+FDIRECT_ROWS = int(os.environ.get("TENSORFOLD_EXL3_FDIRECT_ROWS", "48"))   # 4-bit calls this short: fdirect (0: never)
 SCOPE: list | None = None            # layer-major prefill: the layers whose W'' is held now (None: none is held)
 
 
@@ -162,6 +163,11 @@ def matmul(layer: Exl3Linear, x: torch.Tensor, out: torch.Tensor, ws: Workspace)
     ext = _ext()
     if FOLD and ws.fold and out.dtype == torch.bfloat16 and x.dtype == torch.bfloat16:
         wq = getattr(layer, "_prompt_w", None) if SCOPE is not None else None
+        if (wq is None and m <= FDIRECT_ROWS and FOLD_BF16 and layer.k2 == 8 and x.stride(1) == 1
+                and x.stride(0) % 2 == 0 and x.data_ptr() % 4 == 0):   # bf16 W'' rebuilt in the GEMM: the same bits
+            ext.fdirect(x, layer.words, *layer.strides, layer.suh, layer.svh, layer.bias, out, layer.k2,
+                        CODEBOOK_IDS[layer.codebook])
+            return out
         if wq is None:
             wdt = torch.bfloat16 if FOLD_BF16 else torch.float16
             wq = (torch.empty((k, n), device=x.device, dtype=wdt) if SCOPE is not None

@@ -8,6 +8,8 @@ void exl3_linear_cuda(const at::Tensor&, const at::Tensor&, int64_t, int64_t, co
 void exl3_unpack_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 void exl3_unpack_fold_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 void exl3_unpack_fold2_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
+void exl3_fdirect_cuda(const at::Tensor&, const at::Tensor&, int64_t, int64_t, const at::Tensor&, const at::Tensor&,
+                       const c10::optional<at::Tensor>&, at::Tensor&, int64_t, int64_t);
 
 static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
@@ -98,7 +100,25 @@ void unpack_fold2(const at::Tensor& T, const at::Tensor& suh, at::Tensor W, int6
     exl3_unpack_fold2_cuda(T, suh, W, stride_k, stride_nb, K2, cb);
 }
 
+// out [M, N] bf16 = x @ W'' * svh + bias with W'' rebuilt in the kernel, never written: unpack_fold2 + _gemm_fold's bits.
+void fdirect(const at::Tensor& x, const at::Tensor& T, int64_t stride_k, int64_t stride_nb, const at::Tensor& suh,
+             const at::Tensor& svh, const c10::optional<at::Tensor>& bias, at::Tensor out, int64_t K2, int64_t cb) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16 && x.dim() == 2 && x.stride(1) == 1, "x: bf16 [M, K]");
+    TORCH_CHECK(x.stride(0) % 2 == 0 && reinterpret_cast<uintptr_t>(x.data_ptr()) % 4 == 0, "x alignment");
+    check(T, at::kInt, "T");
+    check(suh, at::kHalf, "suh");
+    check(svh, at::kHalf, "svh");
+    TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kBFloat16 && out.dim() == 2 && out.stride(1) == 1,
+                "out: bf16 [M, N], unit column stride");
+    TORCH_CHECK(out.size(0) == x.size(0) && suh.numel() == x.size(1) && svh.numel() == out.size(1), "shapes");
+    TORCH_CHECK(x.size(1) % 128 == 0 && out.size(1) % 128 == 0, "K and N must be multiples of 128");
+    if (bias) check(*bias, at::kHalf, "bias");
+    c10::cuda::CUDAGuard guard(x.device());
+    exl3_fdirect_cuda(x, T, stride_k, stride_nb, suh, svh, bias, out, K2, cb);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("fdirect", &fdirect);
     m.def("unpack_fold", &unpack_fold);
     m.def("unpack_fold2", &unpack_fold2);
     m.def("rot_in", &rot_in);

@@ -120,7 +120,9 @@ Prompt chunks take their own arithmetic, as the MLX 4-bit path's prompt matmul d
 family whose prompt rows are bf16 can opt in to the folded path with `Workspace(fold=True)`, as the 27B does: each
 call decodes W'' = diag(suh) H W_q H / 128, both rotations folded into the weights and rounded once to bf16
 (`unpack_fold2`), and a fixed-tile bf16 GEMM with fp32 accumulation multiplies the raw rows by it before `svh` and
-the bias, so no `rot_in` pass runs. Otherwise the input rotation is decode's, W_q is decoded once a call into fp16, a
+the bias, so no `rot_in` pass runs. A 4-bit call of up to 48 rows with no W'' held (a short prompt, a short follow-up)
+runs `fdirect` instead, which rebuilds each W'' block exactly as `unpack_fold2` does and feeds it straight into the
+same mma chain: the same bits without writing W''. Otherwise the input rotation is decode's, W_q is decoded once a call into fp16, a
 fixed-tile fp16 GEMM with fp32 accumulation multiplies it, and its epilogue rotates each 128-column block (the
 accumulator's bf16 high and low halves times H) before `svh` and the bias. Either way tiles depend on the shape
 alone, so a row's bits never depend on its chunk and a resumed prompt equals a fresh one; they differ from decode's,
@@ -129,7 +131,8 @@ a prompt, keeps the decode linear.
 
 Switches, read at import: `TENSORFOLD_EXL3_FOLD=0` puts every family on the W_q path; `TENSORFOLD_EXL3_FOLD_BF16=0`
 keeps W'' in fp16 and rounds the rows to fp16 in the GEMM; `TENSORFOLD_EXL3_FOLD2=0` decodes W'' with `unpack_fold`,
-the plain kernel `unpack_fold2` reproduces bit for bit.
+the plain kernel `unpack_fold2` reproduces bit for bit; `TENSORFOLD_EXL3_FDIRECT_ROWS` sets the rows `fdirect` takes
+(48; 0 turns it off).
 
 ## Numbers
 

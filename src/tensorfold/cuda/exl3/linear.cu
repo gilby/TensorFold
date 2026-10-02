@@ -617,6 +617,163 @@ __global__ void __launch_bounds__(256, 2) unpack_fold2_kernel(const uint32_t* __
 #undef BF
 }
 
+// fdirect_kernel: out [M, N] bf16 = (x [M, K] bf16 @ W'') * svh + bias for M <= 16 MT rows, W'' never written: each
+// program owns one 128-column block and walks K in 128-row blocks in order, rebuilding each W'' block exactly as
+// unpack_fold2_kernel does (same decode, same butterflies, same rounding, the same 64-column halves in s16), and
+// feeds it straight into one mma.m16n8k16 bf16 chain over K in k16 order from zero, the chain tl.dot runs in
+// _gemm_fold (a plain chain reproduced its bits on every 27B shape at 1-128 rows), so the output equals unpack_fold2 +
+// _gemm_fold bit for bit.
+template <int K2, int CB, int MT>
+__global__ void __launch_bounds__(256, 1) fdirect_kernel(const __nv_bfloat16* __restrict__ x, int ldx,
+                                                         const uint32_t* __restrict__ T, const half* __restrict__ suh,
+                                                         const half* __restrict__ svh, const half* __restrict__ bias,
+                                                         __nv_bfloat16* __restrict__ out, int ldo, int M, int K, int N,
+                                                         int64_t stride_k, int64_t stride_nb) {
+    __shared__ float s32[128 * 64];
+    __shared__ uint32_t s16[128 * 32];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int bx = blockIdx.x;
+    const int g8 = lane >> 2, t4 = lane & 3;
+    const int c = lane & 7, r3 = (lane >> 3) & 1, r4 = lane >> 4;
+    const unsigned short* s16h = reinterpret_cast<const unsigned short*>(s16);
+    float acc[2][MT][4];
+#pragma unroll
+    for (int hf = 0; hf < 2; ++hf)
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) acc[hf][mt][i] = 0.f;
+#define BF(a, b) { const float x0 = (a), x1 = (b); (a) = x0 + x1; (b) = x0 - x1; }
+    uint32_t w[8][lane_words<K2>()];             // this warp's words of the next block, in flight during this one
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+        ldg_lane_words<K2>(T + (int64_t)warp * stride_k + (int64_t)bx * stride_nb + j * tile_words<K2>(), lane, w[j]);
+#pragma unroll 1
+    for (int by = 0; by < K / 128; ++by) {
+        float v[8][8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            uint32_t b[2][2];
+            decode_lane<K2, CB>(w[j], lane, b[0], b[1]);
+#pragma unroll
+            for (int jj = 0; jj < 8; ++jj) {
+                const uint32_t u = b[jj >> 2][(jj >> 1) & 1];
+                const unsigned short h = (jj & 1) ? (unsigned short)(u >> 16) : (unsigned short)(u & 0xffffu);
+                v[j][jj] = __half2float(__ushort_as_half(h));
+            }
+        }
+        if (by + 1 < K / 128) {
+            const int kt = (by + 1) * 8 + warp;
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                ldg_lane_words<K2>(T + (int64_t)kt * stride_k + (int64_t)bx * stride_nb + j * tile_words<K2>(), lane,
+                                   w[j]);
+        }
+#pragma unroll
+        for (int jj = 0; jj < 8; ++jj) {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) if (!(j & 2)) BF(v[j][jj], v[j | 2][jj]);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) BF(v[j][jj], v[j | 4][jj]);
+#pragma unroll
+            for (int m = 4; m <= 16; m <<= 1)
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float o = __shfl_xor_sync(0xffffffffu, v[j][jj], m);
+                    v[j][jj] = (lane & m) ? o - v[j][jj] : v[j][jj] + o;
+                }
+        }
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+#pragma unroll
+            for (int jj = 0; jj < 4; ++jj) BF(v[j][jj], v[j][jj | 4]);
+#pragma unroll
+        for (int j = 0; j < 8; j += 2)
+#pragma unroll
+            for (int jj = 0; jj < 8; ++jj) BF(v[j][jj], v[j | 1][jj]);
+#pragma unroll
+        for (int hf = 0; hf < 2; ++hf) {
+#pragma unroll
+            for (int t = 0; t < 4; ++t)
+#pragma unroll
+                for (int jj = 0; jj < 8; ++jj) {
+                    const int row = warp * 16 + value_row(lane, jj), col = 16 * t + value_col(lane, jj);
+                    const int g = (((row >> 1) ^ (row >> 3)) & 1) | ((((row >> 2) ^ (row >> 4)) & 1) << 1);
+                    s32[row * 64 + (col ^ (8 * g))] = v[4 * hf + t][jj];
+                }
+            __syncthreads();
+            {
+                float u[32];
+                const int col = warp * 8 + c;
+#pragma unroll
+                for (int i = 0; i < 32; ++i) {
+                    const int row = ((i >> 2) & 7) + 8 * r3 + 16 * r4 + 32 * (i & 1) + 64 * ((i >> 1) & 1);
+                    const int g = (((row >> 1) ^ (row >> 3)) & 1) | ((((row >> 2) ^ (row >> 4)) & 1) << 1);
+                    u[i] = s32[row * 64 + (col ^ (8 * g))];
+                }
+#pragma unroll
+                for (int bit = 1; bit < 32; bit <<= 1)
+#pragma unroll
+                    for (int i = 0; i < 32; ++i) if (!(i & bit)) BF(u[i], u[i | bit]);
+#pragma unroll
+                for (int m = 8; m <= 16; m <<= 1)
+#pragma unroll
+                    for (int i = 0; i < 32; ++i) {
+                        const float o = __shfl_xor_sync(0xffffffffu, u[i], m);
+                        u[i] = (lane & m) ? o - u[i] : u[i] + o;
+                    }
+                unsigned short* w16 = reinterpret_cast<unsigned short*>(s16);
+#pragma unroll
+                for (int i = 0; i < 32; ++i) {
+                    const int row = ((i >> 2) & 7) + 8 * r3 + 16 * r4 + 32 * (i & 1) + 64 * ((i >> 1) & 1);
+                    const float f = u[i] * (HAD_SCALE * HAD_SCALE) * __half2float(suh[by * 128 + row]);
+                    const int word = (col >> 1) ^ (4 * (r3 + 2 * r4));
+                    w16[row * 64 + 2 * word + (col & 1)] = __bfloat16_as_ushort(__float2bfloat16_rn(f));
+                }
+            }
+            __syncthreads();
+            // this half's W'' block [128 k][64 n] is in s16: the warp's n8 tile (columns 8 warp .. 8 warp + 7)
+            const int ncol = 8 * warp + g8;
+#pragma unroll
+            for (int kk = 0; kk < 8; ++kk) {
+                const int k0 = 16 * kk + 2 * t4;
+                auto wv = [&](int row) -> uint32_t {
+                    const int word = (ncol >> 1) ^ (4 * ((row >> 3) & 3));
+                    return s16h[row * 64 + 2 * word + (ncol & 1)];
+                };
+                uint32_t b[2] = {wv(k0) | (wv(k0 + 1) << 16), wv(k0 + 8) | (wv(k0 + 9) << 16)};
+                const int kg = by * 128 + k0;
+#pragma unroll
+                for (int mt = 0; mt < MT; ++mt) {
+                    const int ra = mt * 16 + g8, rb = ra + 8;
+                    uint32_t a[4];
+                    a[0] = ra < M ? __ldg(reinterpret_cast<const uint32_t*>(x + (int64_t)ra * ldx + kg)) : 0u;
+                    a[1] = rb < M ? __ldg(reinterpret_cast<const uint32_t*>(x + (int64_t)rb * ldx + kg)) : 0u;
+                    a[2] = ra < M ? __ldg(reinterpret_cast<const uint32_t*>(x + (int64_t)ra * ldx + kg + 8)) : 0u;
+                    a[3] = rb < M ? __ldg(reinterpret_cast<const uint32_t*>(x + (int64_t)rb * ldx + kg + 8)) : 0u;
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
+                                 "{%8,%9}, {%0,%1,%2,%3};\n"
+                                 : "+f"(acc[hf][mt][0]), "+f"(acc[hf][mt][1]), "+f"(acc[hf][mt][2]), "+f"(acc[hf][mt][3])
+                                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+                }
+            }
+        }
+    }
+#undef BF
+#pragma unroll
+    for (int hf = 0; hf < 2; ++hf)
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int r = mt * 16 + g8 + 8 * (i >> 1), col = bx * 128 + 64 * hf + 8 * warp + 2 * t4 + (i & 1);
+                if (r >= M) continue;
+                float y = __fmul_rn(acc[hf][mt][i], __half2float(svh[col]));
+                if (bias) y = __fadd_rn(y, __half2float(bias[col]));
+                out[(int64_t)r * ldo + col] = __float2bfloat16_rn(y);
+            }
+}
+
 int dtype_of(const at::Tensor& t) {
     return t.scalar_type() == at::kFloat ? F32 : t.scalar_type() == at::kBFloat16 ? BF16 : F16;
 }
@@ -752,4 +909,32 @@ void exl3_unpack_fold2_cuda(const at::Tensor& T, const at::Tensor& suh, at::Tens
     TF_EXL3_ALL(TF_LAUNCH)
 #undef TF_LAUNCH
     TORCH_CHECK(false, "unsupported EXL3 width/codebook: K2=", K2, " codebook=", cb);
+}
+
+void exl3_fdirect_cuda(const at::Tensor& x, const at::Tensor& T, int64_t stride_k, int64_t stride_nb,
+                       const at::Tensor& suh, const at::Tensor& svh, const c10::optional<at::Tensor>& bias,
+                       at::Tensor& out, int64_t K2, int64_t cb) {
+    const int M = (int)x.size(0), K = (int)x.size(1), N = (int)out.size(1);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const half* bptr = bias ? reinterpret_cast<const half*>(bias->data_ptr()) : nullptr;
+    TORCH_CHECK(K2 == 8, "fdirect: 4-bit tiles only");
+    for (int r0 = 0; r0 < M; r0 += 128) {            // rows are independent: 128-row slices keep their bits
+        const int m = std::min(128, M - r0);
+        const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()) + (int64_t)r0 * x.stride(0);
+        auto* op = reinterpret_cast<__nv_bfloat16*>(out.data_ptr()) + (int64_t)r0 * out.stride(0);
+#define TF_FD(CB_, MT_)                                                                                         \
+        if (cb == CB_ && (m + 15) / 16 <= MT_) {                                                                \
+            fdirect_kernel<8, CB_, MT_><<<dim3((unsigned)(N / 128)), 256, 0, stream>>>(                         \
+                xp, (int)x.stride(0), reinterpret_cast<const uint32_t*>(T.data_ptr()),                          \
+                reinterpret_cast<const half*>(suh.data_ptr()), reinterpret_cast<const half*>(svh.data_ptr()),  \
+                bptr, op, (int)out.stride(0), m, K, N, stride_k, stride_nb);                                    \
+            C10_CUDA_KERNEL_LAUNCH_CHECK();                                                                     \
+            continue;                                                                                           \
+        }
+#define TF_FD_CB(CB_) TF_FD(CB_, 1) TF_FD(CB_, 2) TF_FD(CB_, 3) TF_FD(CB_, 4) TF_FD(CB_, 8)
+        TF_FD_CB(0) TF_FD_CB(1) TF_FD_CB(2)
+#undef TF_FD_CB
+#undef TF_FD
+        TORCH_CHECK(false, "fdirect: unsupported codebook ", cb);
+    }
 }

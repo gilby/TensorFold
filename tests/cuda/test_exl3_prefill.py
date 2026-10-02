@@ -128,3 +128,20 @@ def test_the_folded_path_is_opt_in(monkeypatch):
     assert not torch.equal(_run(layer, x, prefill.Workspace(fold=True)), plain)
     monkeypatch.setattr(prefill, "FOLD", False)
     assert torch.equal(_run(layer, x, prefill.Workspace(fold=True)), plain)
+
+
+@pytest.mark.parametrize("codebook,k,n,bias", [("mul1", 5120, 6144, False), ("mul1", 17408, 5120, False),
+                                                ("mul1", 6144, 5120, True), ("3inst", 1024, 512, True),
+                                                ("mcg", 512, 1024, False)])
+def test_fdirect_gives_unpack_fold2_and_the_gemms_bits(monkeypatch, codebook, k, n, bias):
+    """4-bit calls of up to FDIRECT_ROWS rows rebuild W'' inside one kernel: the bits of W'' decoded and then
+    multiplied, at every row count it may take (one kernel per 128-row slice above 128)."""
+
+    layer = _layer(codebook, 4, k, n, seed=k, bias=bias)
+    ws = prefill.Workspace(fold=True)
+    x = _rows(200, k, seed=2)
+    monkeypatch.setattr(prefill, "FDIRECT_ROWS", 0)
+    want = _run(layer, x, ws)
+    monkeypatch.setattr(prefill, "FDIRECT_ROWS", 200)
+    for m in (1, 3, 16, 17, 33, 48, 64, 100, 128, 200):
+        assert torch.equal(_run(layer, x[:m], ws), want[:m]), f"{m} rows"

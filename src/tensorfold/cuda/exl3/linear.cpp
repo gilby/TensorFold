@@ -34,7 +34,8 @@ void rot_in(const at::Tensor& x, const at::Tensor& suh, at::Tensor xh) {
 }
 
 // y [M, N] = (xh @ W_q) @ H * svh + bias; Z [SK, M, N] fp32 when SK > 1; counters int32 [8 * N / 128], left zero.
-// mode picks the kernel for 17-128 rows (0: linear_kernel; 6: the mid-M kernels); every mode gives the same bits.
+// mode picks the kernel for 17-128 rows (0: linear_kernel; 6: the mid-M kernels; 7: linear_wc for 4- and 6-bit mul1,
+// else 6); every mode gives the same bits.
 void linear(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int64_t stride_nb, const at::Tensor& svh,
             const c10::optional<at::Tensor>& bias, at::Tensor y, const c10::optional<at::Tensor>& Z,
             at::Tensor counters, int64_t K2, int64_t cb, int64_t SK, int64_t WK, int64_t mode) {

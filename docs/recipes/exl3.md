@@ -106,8 +106,13 @@ its rows independent — which is the verify path's contract (`docs/recipes/cuda
 `linear_kernel` runs 16 rows a pass and decodes every tile again each pass, so from 17 rows (verify windows of several
 streams) the mid-M kernels take the call: each CTA holds 16 rows (17-48) or 32 (49-128) of one column block, and the
 CTAs of a block sit side by side in the grid so they read its words from L2 together. They keep `linear_kernel`'s K
-ranges, mma chain and fixed-order sums, so every output bit is the same at any row count; `TENSORFOLD_EXL3_MIDM=0`
-keeps `linear_kernel` throughout.
+ranges, mma chain and fixed-order sums, so every output bit is the same at any row count. For 4- and 6-bit `mul1`
+layers `linear_wc.cuh` takes 17-128 rows first: a CTA holds 32 or 64 rows of one column block and one K split, each
+warp decodes its column tile once a CTA straight into mma fragments, and words and rows stream through a 4-stage
+`cp.async` ring; layers split over K with 32+ column blocks run every split in one CTA and add the split sums in
+registers in split order, with no Z buffer. The same chain and order again give `linear_kernel`'s bits.
+`TENSORFOLD_EXL3_WC=0` leaves 17-128 rows to the mid-M kernels, and `TENSORFOLD_EXL3_MIDM=0` keeps `linear_kernel`
+throughout.
 
 ## Prompts
 

@@ -635,6 +635,8 @@ void exl3_rot_in_cuda(const at::Tensor& x, const at::Tensor& suh, at::Tensor& xh
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+#include "linear_wc.cuh"
+
 void exl3_linear_cuda(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int64_t stride_nb,
                       const at::Tensor& svh, const c10::optional<at::Tensor>& bias, at::Tensor& y,
                       const c10::optional<at::Tensor>& Z, at::Tensor& counters, int64_t K2, int64_t cb, int64_t SK,
@@ -649,7 +651,12 @@ void exl3_linear_cuda(const at::Tensor& xh, const at::Tensor& T, int64_t stride_
     const int has_bias = bias ? 1 : 0;
     float* zptr = Z ? Z->data_ptr<float>() : nullptr;
     TORCH_CHECK(SK == 1 || zptr, "Z is needed with more than one split");
-    constexpr int MIDM = 6;                       // mode: 0 linear_kernel at every row count, 6 the mid-M kernels
+    constexpr int MIDM = 6, WC = 7;    // mode: 0 linear_kernel at every row count, 6 the mid-M kernels, 7 linear_wc
+    if (mode >= WC && cb == CB_MUL1 &&
+        (K2 == 8 ? dispatch_wc<8>(xh, T, stride_k, stride_nb, svh, bptr, has_bias, y, zptr, counters, M, K, N, (int)SK, (int)WK)
+                 : K2 == 12 &&
+                       dispatch_wc<12>(xh, T, stride_k, stride_nb, svh, bptr, has_bias, y, zptr, counters, M, K, N, (int)SK, (int)WK)))
+        return;                                   // else the mid-M kernels take it
 #define TF_LAUNCH(K2_, CB_)                                                                                        \
     if (K2 == K2_ && cb == CB_) {                                                                               \
         auto kernel = WK == 2 ? linear_kernel<K2_, CB_, 2>                                                      \

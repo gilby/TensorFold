@@ -10,7 +10,12 @@ MODEL_TYPES = ("qwen3_5_moe",)
 TITLE = "Qwen3.6 MoE"
 LANES = True
 # MLX 4-bit, groups of 64, routers 8-bit, MTP layer in mtp-4bit.safetensors (mlx-community's files take it too)
-MODELS = ("TensorFold/Qwen3.6-35B-A3B-MLX-4bit-MTP", "mlx-community/Qwen3.6-35B-A3B-4bit")
+MODELS = ("TensorFold/Qwen3.6-35B-A3B-MLX-4bit-MTP", "mlx-community/Qwen3.6-35B-A3B-4bit", "nvidia/Qwen3.6-35B-A3B-NVFP4",
+          "UnstableLlama/Qwen3.6-35B-A3B-exl3-4.00bpw")
+# CUDA also reads ModelOpt checkpoints (FP8 / NVFP4 projections, W4A16 NVFP4 experts) and EXL3 packs of any codebook
+# and width; both draft with a bf16 MTP layer (their own, or mtp.safetensors beside an EXL3 pack, which drops it)
+QUANT_METHODS = {"cuda": ("mlx", "modelopt", "exl3")}
+EXL3_VARIANT = "any"                           # tensorfold.families.EXL3_VARIANT_ANY
 REQUIRED_FILES = {MODELS[0]: ("mtp-4bit.safetensors",)}
 DRAFTER = ""                  # Macs and CUDA draft with the checkpoint's MTP layer; --drafter takes a DFlash v1 model
 DFLASH = "z-lab/Qwen3.6-35B-A3B-DFlash"       # Macs, --drafter: chains of each position's own argmax
@@ -22,7 +27,7 @@ CUDA_PREFILL_FP8 = True            # --prefill-fp8: the attention and DeltaNet p
 
 
 def check(model_dir: str | Path) -> None:
-    """CUDA: one GPU, MLX 4-bit weights in groups of 64. Macs: the row decoder's rule, any MLX affine width and group."""
+    """CUDA: one GPU, MLX 4-bit weights in groups of 64 or a ModelOpt NVFP4 checkpoint. Macs: the row decoder's rule, any MLX affine width and group."""
 
     import sys
 
@@ -38,6 +43,10 @@ def check(model_dir: str | Path) -> None:
         if why:
             raise ValueError(f"{TITLE} cannot run this checkpoint on a Mac: {why}. {OWN_MODEL_HELP}")
         return
+    from tensorfold.families import quant_method
+
+    if quant_method(config) in ("modelopt", "exl3"):
+        return                               # require_readable checks its schemes, the loader each tensor's
     if quantization(config) != CUDA_QUANTIZATION:
         raise ValueError(f"{TITLE}'s CUDA engine reads MLX 4-bit weights in groups of 64 ({MODELS[0]}); this "
                          f"checkpoint has {describe_quantization(config)}. {OWN_MODEL_HELP}")

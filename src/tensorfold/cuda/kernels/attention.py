@@ -1,4 +1,8 @@
-"""Tree attention folds absolute-position groups in a fixed order, independent of committed and drafted rows."""
+"""Tree attention folds absolute-position groups in a fixed order, independent of committed and drafted rows.
+
+Caches and window rows are bf16, or int8 rows packed by ``kvpack`` (codes in the cache's H32 rotation, then fp16
+scales): then every key a row reads, committed or on its own path, is dequantized alike, the query rides the rotation
+(q . Hk = Hq . k) and the merged output is rotated back (p . Hv = H (p . v))."""
 
 from __future__ import annotations
 
@@ -13,6 +17,10 @@ import triton.language as tl
 
 from tensorfold.cuda.build import volta
 
+from tensorfold.families.qwen4_exp.cuda.kvquant import dequant_group_8, h32
+
+from . import kvpack
+
 TILE = 64
 CHUNK = 512
 GROUP = 4               # chunks folded into one fp32 partial
@@ -20,6 +28,8 @@ SPAN = CHUNK * GROUP
 MIN_GROUPED = 64        # groups times window rows needed to keep enough programs busy
 MAX_NODES = 128
 QUERY_TILE = 16
+PACKED_TILE = 32        # (row, head) pairs a program dequantizes a packed key tile for (16: 6 dequants a tile for a
+                        # 16-row window of 24 heads; 64: register spills); measured on GB10, docs/recipes/qwen3.8-27b.md
 MERGE_COLUMNS = 64      # output columns a merge program folds (the chunk fold is per column: more programs, same bits)
 
 
@@ -68,9 +78,23 @@ def _fold(m, l, o, cm, cl, co):
 
 
 @triton.jit
+def _packed(P8, P16, off, rows, mask, hk, HK: tl.constexpr, D: tl.constexpr, RB: tl.constexpr):
+    """64 rows' KV head ``hk`` from packed rows ``off`` bf16 elements past P8/P16, dequantized in the cache's rotation:
+    ``(code + 0.5) * s / 128`` (masked rows: 0)."""
+
+    d = tl.arange(0, D)
+    g = tl.arange(0, D // 32)
+    at = (rows[:, None] * HK + hk) * RB
+    code = tl.load(P8 + off * 2 + at + d[None, :], mask=mask[:, None], other=0)
+    scale = tl.load(P16 + off + (at + D) // 2 + g[None, :], mask=mask[:, None], other=0.0)
+    return dequant_group_8(code, scale, M=64, W=D)
+
+
+@triton.jit
 def _shared(Q, KC, VC, OFF, STREAM, ITEMS, PO, PM, PL, W, H: tl.constexpr, HK: tl.constexpr, D: tl.constexpr,
-            G: tl.constexpr, CH: tl.constexpr, SCALE: tl.constexpr, GR: tl.constexpr):
-    """An item code is a whole group j >= 0, or chunk -1-j after the whole groups."""
+            G: tl.constexpr, CH: tl.constexpr, SCALE: tl.constexpr, GR: tl.constexpr, K8, K16, QB: tl.constexpr,
+            RB: tl.constexpr, QT: tl.constexpr):
+    """QT (row, head) pairs of one stream against an item: a whole group j >= 0, or chunk -1-j after the groups."""
 
     item = tl.program_id(0) // HK            # a chunk's heads and query tiles launch together: one DRAM read
     hk = tl.program_id(0) % HK
@@ -88,26 +112,30 @@ def _shared(Q, KC, VC, OFF, STREAM, ITEMS, PO, PM, PL, W, H: tl.constexpr, HK: t
     if ((chunk + n) * CH <= p) & (code < groups):     # a padded plan (a graph's) skips what the keys don't fill
         koff = tl.multiple_of(tl.load(OFF + s * 2), 8)     # ``offsets`` checks 16 bytes: loads go 16 bytes wide
         voff = tl.multiple_of(tl.load(OFF + s * 2 + 1), 8)
-        rr = first + tl.arange(0, 16)
+        rr = first + tl.arange(0, QT)
         ok = rr < rows * G
         node = start + rr // G
         head = hk * G + rr % G
         d = tl.arange(0, D)
         q = tl.load(Q + (node[:, None] * H + head[:, None]) * D + d[None, :], mask=ok[:, None],
                     other=0).to(tl.bfloat16)
-        gm = tl.full((16,), float("-inf"), tl.float32)
-        gl = tl.zeros((16,), tl.float32)
-        go = tl.zeros((16, D), tl.float32)
+        gm = tl.full((QT,), float("-inf"), tl.float32)
+        gl = tl.zeros((QT,), tl.float32)
+        go = tl.zeros((QT, D), tl.float32)
         m, l, o = gm, gl, go
         for c in range(n):
             key = (chunk + c) * CH + tl.arange(0, 64)
-            m = tl.full((16,), float("-inf"), tl.float32)
-            l = tl.zeros((16,), tl.float32)
-            o = tl.zeros((16, D), tl.float32)
+            m = tl.full((QT,), float("-inf"), tl.float32)
+            l = tl.zeros((QT,), tl.float32)
+            o = tl.zeros((QT, D), tl.float32)
             for t in range(CH // 64):
                 ki = key + t * 64
-                kk = tl.load(KC + koff + (ki[:, None] * HK + hk) * D + d[None, :]).to(tl.bfloat16)
-                vv = tl.load(VC + voff + (ki[:, None] * HK + hk) * D + d[None, :]).to(tl.bfloat16)
+                if QB:
+                    kk = _packed(K8, K16, koff, ki, ki < p, hk, HK, D, RB)
+                    vv = _packed(K8, K16, voff, ki, ki < p, hk, HK, D, RB)
+                else:
+                    kk = tl.load(KC + koff + (ki[:, None] * HK + hk) * D + d[None, :]).to(tl.bfloat16)
+                    vv = tl.load(VC + voff + (ki[:, None] * HK + hk) * D + d[None, :]).to(tl.bfloat16)
                 m, l, o = _tile(q, kk, vv, m, l, o, ki < p, SCALE)
             gm, gl, go = _fold(gm, gl, go, m, l, o)
         if not whole:                         # a chunk's partial goes out as the tail writes its own: unfolded
@@ -121,7 +149,7 @@ def _shared(Q, KC, VC, OFF, STREAM, ITEMS, PO, PM, PL, W, H: tl.constexpr, HK: t
 @triton.jit
 def _tail(Q, KN, VN, KC, VC, OFF, STREAM, ROWS, PATHS, DEPTHS, PO, PM, PL, W, H: tl.constexpr, HK: tl.constexpr,
           D: tl.constexpr, G: tl.constexpr, CH: tl.constexpr, MAXD: tl.constexpr, SCALE: tl.constexpr,
-          GR: tl.constexpr):
+          GR: tl.constexpr, K8, K16, KN16, VN16, QB: tl.constexpr, RB: tl.constexpr):
     """Row, head group, tail chunk: the last committed keys and the row's own path."""
 
     node = tl.program_id(0)
@@ -148,12 +176,20 @@ def _tail(Q, KN, VN, KC, VC, OFF, STREAM, ROWS, PATHS, DEPTHS, PO, PM, PL, W, H:
             path_slot = logical - p
             on_path = (path_slot >= 0) & (path_slot < depth)
             path_node = tl.load(PATHS + node * MAXD + path_slot, mask=on_path, other=0)
-            kc = tl.load(KC + koff + (logical[:, None] * HK + hk) * D + d[None, :], mask=committed[:, None], other=0)
-            vc = tl.load(VC + voff + (logical[:, None] * HK + hk) * D + d[None, :], mask=committed[:, None], other=0)
-            kn = tl.load(KN + (path_node[:, None] * HK + hk) * D + d[None, :], mask=on_path[:, None], other=0)
-            vn = tl.load(VN + (path_node[:, None] * HK + hk) * D + d[None, :], mask=on_path[:, None], other=0)
-            kk = tl.where(committed[:, None], kc, kn).to(tl.bfloat16)
-            vv = tl.where(committed[:, None], vc, vn).to(tl.bfloat16)
+            if QB:                    # the path's packed rows are what a commit copies: serial decoding reads the same
+                kk = tl.where(committed[:, None], _packed(K8, K16, koff, logical, committed, hk, HK, D, RB),
+                              _packed(KN, KN16, 0, path_node, on_path, hk, HK, D, RB))
+                vv = tl.where(committed[:, None], _packed(K8, K16, voff, logical, committed, hk, HK, D, RB),
+                              _packed(VN, VN16, 0, path_node, on_path, hk, HK, D, RB))
+            else:
+                kc = tl.load(KC + koff + (logical[:, None] * HK + hk) * D + d[None, :], mask=committed[:, None],
+                             other=0)
+                vc = tl.load(VC + voff + (logical[:, None] * HK + hk) * D + d[None, :], mask=committed[:, None],
+                             other=0)
+                kn = tl.load(KN + (path_node[:, None] * HK + hk) * D + d[None, :], mask=on_path[:, None], other=0)
+                vn = tl.load(VN + (path_node[:, None] * HK + hk) * D + d[None, :], mask=on_path[:, None], other=0)
+                kk = tl.where(committed[:, None], kc, kn).to(tl.bfloat16)
+                vv = tl.where(committed[:, None], vc, vn).to(tl.bfloat16)
             m, l, o = _tile(q, kk, vv, m, l, o, committed | on_path, SCALE)
         base = ((chunk - groups * (GR - 1)) * W + node) * H + hk * G + gg      # the chunk's slot
         tl.store(PO + base[:, None] * D + d[None, :], o, mask=gg[:, None] < G)
@@ -163,7 +199,7 @@ def _tail(Q, KN, VN, KC, VC, OFF, STREAM, ROWS, PATHS, DEPTHS, PO, PM, PL, W, H:
 
 @triton.jit
 def _merge(PO, PM, PL, OUT, STREAM, ROWS, W, H: tl.constexpr, D: tl.constexpr, G: tl.constexpr, DS: tl.constexpr,
-           CH: tl.constexpr, GR: tl.constexpr):
+           CH: tl.constexpr, GR: tl.constexpr, QB: tl.constexpr):
     """Fold every group's chunks in order, then each group in order, regardless of where it was computed."""
 
     node = tl.program_id(0)
@@ -198,6 +234,8 @@ def _merge(PO, PM, PL, OUT, STREAM, ROWS, W, H: tl.constexpr, D: tl.constexpr, G
             gl = tl.zeros((16,), tl.float32)
             go = tl.zeros((16, DS), tl.float32)
     result = o / l[:, None]
+    if QB:                       # values are stored rotated: one H32 a 32-column group restores the merged output
+        result = tl.reshape(h32(tl.reshape(result, (16 * DS // 32, 32)), M=16 * DS // 32), (16, DS))
     tl.store(OUT + (node * H + head[:, None]) * D + d[None, :], result.to(tl.bfloat16), mask=gg[:, None] < G)
 
 
@@ -229,6 +267,7 @@ class Plan:
     depths: torch.Tensor        # (W,) int32
     chunks: int                 # the most partial slots any stream has
     width: int                  # W
+    tile: int = QUERY_TILE      # (row, head) pairs an item holds: PACKED_TILE for int8 caches
 
 
 def groups(p: int, w: int) -> int:
@@ -245,7 +284,8 @@ def slots(p: int, w: int) -> int:
     return g + -(-(p + w) // CHUNK) - g * GROUP
 
 
-def plan_host(parents: Sequence[Sequence[int]], lengths: Sequence[int], group: int) -> tuple[list[int], int, int]:
+def plan_host(parents: Sequence[Sequence[int]], lengths: Sequence[int], group: int,
+              tile: int = QUERY_TILE) -> tuple[list[int], int, int]:
     """Host half of ``plan`` from window-local parents, committed key counts and ``group`` query heads a key head."""
 
     rows, streams, items, glob = [], [], [], []
@@ -262,30 +302,38 @@ def plan_host(parents: Sequence[Sequence[int]], lengths: Sequence[int], group: i
         g = groups(p, w)
         codes = list(range(g)) + [-1 - j for j in range(p // CHUNK - g * GROUP)]    # folded groups, then chunks
         for code in codes:
-            for first in range(0, w * group, QUERY_TILE):
+            for first in range(0, w * group, tile):
                 items += [s, first, code]
         start += w
     return rows + streams + items + glob, len(items) // 3, most
 
 
-def padded_host(parents: Sequence[int], context: int, group: int) -> tuple[list[int], int, int]:
+def padded_host(parents: Sequence[int], context: int, group: int, tile: int = QUERY_TILE) -> tuple[list[int], int, int]:
     """A graph includes all groups and chunks below its context; kernels skip items its keys do not fill."""
 
-    flat, _, _ = plan_host([parents], [0], group)            # rows, the stream's row (refreshed per replay), parents
+    flat, _, _ = plan_host([parents], [0], group, tile)      # rows, the stream's row (refreshed per replay), parents
     w = len(parents)
     codes = list(range(context // SPAN)) + [-1 - j for j in range(context // CHUNK)]
-    items = [x for code in codes for first in range(0, w * group, QUERY_TILE) for x in (0, first, code)]
+    items = [x for code in codes for first in range(0, w * group, tile) for x in (0, first, code)]
     most = -(-(context + w) // CHUNK)                        # ``slots`` of any p <= context is at most this
     return flat[:w + 4] + items + flat[w + 4:], len(items) // 3, most
 
 
-def plan(parents: Sequence[Sequence[int]], lengths: Sequence[int], group: int, device) -> Plan:
-    flat, n_items, most = plan_host(parents, lengths, group)
+def plan(parents: Sequence[Sequence[int]], lengths: Sequence[int], group: int, device, *,
+         tile: int = QUERY_TILE) -> Plan:
+    flat, n_items, most = plan_host(parents, lengths, group, tile)
     dev = torch.tensor(flat, dtype=torch.int32).pin_memory().to(device, non_blocking=True)
-    return from_packed(dev, len(parents), sum(len(p) for p in parents), n_items, most)
+    return from_packed(dev, len(parents), sum(len(p) for p in parents), n_items, most, tile=tile)
 
 
-def from_packed(dev: torch.Tensor, streams: int, width: int, n_items: int, chunks: int) -> Plan:
+def tile_for(kv_dtype: str) -> int:
+    """The (row, head) pairs a plan's items hold for a cache of ``kv_dtype``."""
+
+    return PACKED_TILE if kv_dtype == "int8" else QUERY_TILE
+
+
+def from_packed(dev: torch.Tensor, streams: int, width: int, n_items: int, chunks: int, *,
+                tile: int = QUERY_TILE) -> Plan:
     """A ``Plan`` from ``plan_host``'s list already on the device (paths computed here, once a forward)."""
 
     rows = dev[:width]
@@ -295,7 +343,7 @@ def from_packed(dev: torch.Tensor, streams: int, width: int, n_items: int, chunk
     paths = torch.empty((width, MAX_NODES), dtype=torch.int32, device=dev.device)
     depths = torch.empty((width,), dtype=torch.int32, device=dev.device)
     _paths[(width,)](parents, paths, depths, MAXD=MAX_NODES, num_warps=1)
-    return Plan(rows, table, items, parents, paths, depths, chunks, width)
+    return Plan(rows, table, items, parents, paths, depths, chunks, width, tile)
 
 
 def base(device) -> torch.Tensor:
@@ -311,36 +359,50 @@ def _base(index: int) -> torch.Tensor:
 
 
 def offsets(caches: Sequence[tuple[torch.Tensor, torch.Tensor]], device) -> list[int]:
-    """Each stream's key and value cache as bf16 element offsets from ``base(device)``, in stream order."""
+    """Each stream's key and value cache as bf16 element offsets from ``base(device)``, in stream order (int8 packed
+    rows too: their byte offset is twice this)."""
 
     origin = base(device).data_ptr()
     out = []
     for k, v in caches:
         for t in (k, v):
-            if t.dtype != torch.bfloat16 or not t.is_contiguous():
-                raise ValueError("caches: contiguous bf16 tensors")
+            if t.dtype not in (torch.bfloat16, torch.int8) or not t.is_contiguous():
+                raise ValueError("caches: contiguous bf16 tensors, or int8 rows packed by kvpack")
             delta = t.data_ptr() - origin
             if delta % 16:
                 raise ValueError("caches must be 16-byte aligned")
-            out.append(delta // t.element_size())
+            out.append(delta // 2)
     return out
 
 
 def attention(q: torch.Tensor, k_nodes: torch.Tensor, v_nodes: torch.Tensor, offs: torch.Tensor, p: Plan, *,
               scale: float) -> torch.Tensor:
-    """Attend (W, H, D) queries to committed keys and own paths; ``offs`` holds ``offsets`` as device (S, 2) int64."""
+    """Attend (W, H, D) queries to committed keys and own paths; ``offs`` holds ``offsets`` as device (S, 2) int64.
+
+    Node keys and values are bf16 (W, HK, D), or int8 rows from ``kvpack.pack`` (W, HK, row_bytes(D)); the caches
+    ``offs`` points at hold rows of the same kind."""
 
     w, h, d = q.shape
     hk = k_nodes.shape[1]
-    if not (w == p.width and d in (128, 256) and k_nodes.shape == (w, hk, d) and v_nodes.shape == k_nodes.shape
-            and h % hk == 0 and h // hk <= QUERY_TILE):
+    qb = 8 if k_nodes.dtype == torch.int8 else 0
+    width = kvpack.row_bytes(d) if qb else d
+    if not (w == p.width and d in (128, 256) and k_nodes.shape == (w, hk, width) and v_nodes.shape == k_nodes.shape
+            and v_nodes.dtype == k_nodes.dtype and h % hk == 0 and h // hk <= QUERY_TILE):
         raise ValueError("unsupported attention shape")
-    if any(x.dtype != torch.bfloat16 or not x.is_cuda or not x.is_contiguous() for x in (q, k_nodes, v_nodes)):
-        raise ValueError("q and node keys and values must be contiguous CUDA bf16 tensors")
+    if q.dtype != torch.bfloat16 or k_nodes.dtype not in (torch.bfloat16, torch.int8) or \
+            any(not x.is_cuda or not x.is_contiguous() for x in (q, k_nodes, v_nodes)):
+        raise ValueError("q must be contiguous CUDA bf16, node keys and values bf16 or packed int8 rows")
+    if p.tile != (PACKED_TILE if qb else QUERY_TILE):
+        raise ValueError(f"a {'packed int8' if qb else 'bf16'} window's plan needs tile="
+                         f"{PACKED_TILE if qb else QUERY_TILE} (tile_for), not {p.tile}")
     origin = base(q.device)
     if not math.isfinite(scale) or scale <= 0:
         raise ValueError("scale must be positive and finite")
     g = h // hk
+    k8, k16 = origin.view(torch.int8), origin.view(torch.float16)
+    if qb:
+        q = kvpack.rotate(q)                 # the query rides the cache's rotation (q . Hk = Hq . k)
+    kn16, vn16 = (k_nodes.view(torch.float16), v_nodes.view(torch.float16)) if qb else (k_nodes, v_nodes)
     partial_o = torch.empty((p.chunks, w, h, d), dtype=torch.float32, device=q.device)
     partial_m = torch.empty((p.chunks, w, h), dtype=torch.float32, device=q.device)
     partial_l = torch.empty_like(partial_m)
@@ -348,18 +410,21 @@ def attention(q: torch.Tensor, k_nodes: torch.Tensor, v_nodes: torch.Tensor, off
         # sm_70: tl.dot has no tensor-core path there; CUDA kernels write every chunk partial in the same layout
         if g > VOLTA_GROUP:
             raise ValueError(f"the sm_70 attention kernel takes up to {VOLTA_GROUP} query heads a key head, not {g}")
+        if qb:
+            raise ValueError("the sm_70 attention kernel reads bf16 caches, not packed int8 rows")
         _volta_ext().chunks(q, k_nodes, v_nodes, origin, offs, p.streams, p.rows, p.paths, p.depths,
                             partial_o, partial_m, partial_l, p.chunks, scale)
     else:
         if p.items.shape[0]:
             _shared[(p.items.shape[0] * hk,)](q, origin, origin, offs, p.streams, p.items, partial_o, partial_m,
                                               partial_l, w, H=h, HK=hk, D=d, G=g, CH=CHUNK, SCALE=scale, GR=GROUP,
-                                              num_warps=4, num_stages=1)
+                                              K8=k8, K16=k16, QB=qb, RB=width, QT=p.tile, num_warps=4, num_stages=1)
         tails = 1 + -(-MAX_NODES // CHUNK)
         _tail[(w, hk, tails)](q, k_nodes, v_nodes, origin, origin, offs, p.streams, p.rows, p.paths, p.depths,
                               partial_o, partial_m, partial_l, w, H=h, HK=hk, D=d, G=g, CH=CHUNK, MAXD=MAX_NODES,
-                              SCALE=scale, GR=GROUP, num_warps=4, num_stages=1)
-    out = torch.empty_like(q)
+                              SCALE=scale, GR=GROUP, K8=k8, K16=k16, KN16=kn16, VN16=vn16, QB=qb, RB=width,
+                              num_warps=4, num_stages=1)
+    out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
     _merge[(w, hk, d // MERGE_COLUMNS)](partial_o, partial_m, partial_l, out, p.streams, p.rows, w, H=h, D=d, G=g,
-                                        DS=MERGE_COLUMNS, CH=CHUNK, GR=GROUP, num_warps=4)
+                                        DS=MERGE_COLUMNS, CH=CHUNK, GR=GROUP, QB=qb, num_warps=4)
     return out

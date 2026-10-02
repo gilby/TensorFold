@@ -92,7 +92,7 @@ FOLD_TILES = {
 FOLD = os.environ.get("TENSORFOLD_EXL3_FOLD", "1") != "0"            # 0: every family on the W_q path
 FOLD_BF16 = os.environ.get("TENSORFOLD_EXL3_FOLD_BF16", "1") != "0"  # 0: fp16 W'' (and fp16 rows in the GEMM)
 FOLD2 = os.environ.get("TENSORFOLD_EXL3_FOLD2", "1") != "0"          # 0: unpack_fold, the same bits, slower
-FDIRECT_ROWS = int(os.environ.get("TENSORFOLD_EXL3_FDIRECT_ROWS", "48"))   # 4-bit calls this short: fdirect (0: never)
+FDIRECT_ROWS = int(os.environ.get("TENSORFOLD_EXL3_FDIRECT_ROWS", "0"))    # 4-bit calls this short: fdirect (0: never, the default)
 SCOPE: list | None = None            # layer-major prefill: the layers whose W'' is held now (None: none is held)
 
 

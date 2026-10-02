@@ -132,7 +132,7 @@ a prompt, keeps the decode linear.
 Switches, read at import: `TENSORFOLD_EXL3_FOLD=0` puts every family on the W_q path; `TENSORFOLD_EXL3_FOLD_BF16=0`
 keeps W'' in fp16 and rounds the rows to fp16 in the GEMM; `TENSORFOLD_EXL3_FOLD2=0` decodes W'' with `unpack_fold`,
 the plain kernel `unpack_fold2` reproduces bit for bit; `TENSORFOLD_EXL3_FDIRECT_ROWS` sets the rows `fdirect` takes
-(48; 0 turns it off).
+(0, off, by default; 48 turns it on for layers without a bias).
 
 ## Numbers
 

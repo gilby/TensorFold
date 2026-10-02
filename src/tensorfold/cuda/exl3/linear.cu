@@ -6,6 +6,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <algorithm>
+#include <type_traits>
 
 #include "decode.cuh"
 
@@ -283,6 +284,177 @@ __global__ void __launch_bounds__(32) unpack_kernel(const uint32_t* __restrict__
     }
 }
 
+// W'' [K, N] fp16 or bf16 = diag(suh) Hk W_q Hn / 128 for one 128 x 128 block (K block y, N block x): 8 warps decode the
+// block's 64 trellis tiles into fp32 shared memory, then fwht128 runs along every row (N side) and every column (K side,
+// times suh), and the block is stored with one rounding. A lane holds indices lane + 32 q (q = 0..3), a bit
+// permutation of fwht128's 4 lane + q: H is invariant under it, so loads and stores use the same map (conflict-free).
+template <int K2, int CB, typename OutT>
+__global__ void __launch_bounds__(256) unpack_fold_kernel(const uint32_t* __restrict__ T, const half* __restrict__ suh,
+                                                          OutT* __restrict__ W, int N, int64_t stride_k,
+                                                          int64_t stride_nb) {
+    extern __shared__ float fold_tile[];
+    constexpr int LD = 129;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int bx = blockIdx.x, by = blockIdx.y, kt = by * 8 + warp;
+#pragma unroll 1
+    for (int j = 0; j < 8; ++j) {
+        uint32_t w[lane_words<K2>()];
+        ldg_lane_words<K2>(T + (int64_t)kt * stride_k + (int64_t)bx * stride_nb + j * tile_words<K2>(), lane, w);
+        uint32_t b[2][2];
+        decode_lane<K2, CB>(w, lane, b[0], b[1]);
+#pragma unroll
+        for (int jj = 0; jj < 8; ++jj) {
+            const uint32_t v = b[jj >> 2][(jj >> 1) & 1];
+            const unsigned short h = (jj & 1) ? (unsigned short)(v >> 16) : (unsigned short)(v & 0xffffu);
+            fold_tile[(warp * 16 + value_row(lane, jj)) * LD + j * 16 + value_col(lane, jj)] =
+                __half2float(__ushort_as_half(h));
+        }
+    }
+    __syncthreads();
+#pragma unroll 1
+    for (int r = warp * 16; r < warp * 16 + 16; ++r) {           // N side: W_q Hn
+        float v[4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) v[q] = fold_tile[r * LD + lane + 32 * q];
+        fwht128(v, lane);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) fold_tile[r * LD + lane + 32 * q] = v[q];
+    }
+    __syncthreads();
+#pragma unroll 1
+    for (int c = warp * 16; c < warp * 16 + 16; ++c) {           // K side: diag(suh) Hk, and both 1 / sqrt(128)
+        float v[4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) v[q] = fold_tile[(lane + 32 * q) * LD + c];
+        fwht128(v, lane);
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+            fold_tile[(lane + 32 * q) * LD + c] =
+                v[q] * (HAD_SCALE * HAD_SCALE) * __half2float(suh[by * 128 + lane + 32 * q]);
+    }
+    __syncthreads();
+#pragma unroll 1
+    for (int r = warp * 16; r < warp * 16 + 16; ++r) {
+        OutT* dst = W + (int64_t)(by * 128 + r) * N + bx * 128;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const float f = fold_tile[r * LD + lane + 32 * q];
+            if constexpr (sizeof(OutT) == 2 && std::is_same<OutT, half>::value) dst[lane + 32 * q] = __float2half_rn(f);
+            else dst[lane + 32 * q] = __float2bfloat16_rn(f);
+        }
+    }
+}
+
+// unpack_fold2_kernel: the same W'' = diag(suh) Hk W_q Hn / 128 as unpack_fold_kernel, bit for bit, faster. The N-side
+// fwht runs in registers on the decoded fragments (each warp holds 16 whole rows), only the K side goes through shared
+// memory, in two 64-column halves (32 KB fp32 + 16 KB bf16 staging, XOR-swizzled, conflict-free), so 2 blocks fit an SM
+// and the 8 tiles' words of a warp are all in flight at once; the output leaves in 16-byte row stores.
+// Same values in the same butterfly order as fwht128 on its lane + 32 q map (N side bits c5 c6 c0..c4, K side r5 r6
+// r0..r4; x0 + x1 / x0 - x1 at every stage), same scale and suh products, one rounding: identical bits.
+template <int K2, int CB, typename OutT>
+__global__ void __launch_bounds__(256, 2) unpack_fold2_kernel(const uint32_t* __restrict__ T, const half* __restrict__ suh,
+                                                              OutT* __restrict__ W, int N, int64_t stride_k,
+                                                              int64_t stride_nb) {
+    __shared__ float s32[128 * 64];
+    __shared__ uint32_t s16[128 * 32];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int bx = blockIdx.x, by = blockIdx.y, kt = by * 8 + warp;
+    float v[8][8];                       // [tile j][value jj]: row 16 warp + value_row(lane, jj), column 16 j + value_col
+    {
+        uint32_t w[8][lane_words<K2>()];
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            ldg_lane_words<K2>(T + (int64_t)kt * stride_k + (int64_t)bx * stride_nb + j * tile_words<K2>(), lane, w[j]);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            uint32_t b[2][2];
+            decode_lane<K2, CB>(w[j], lane, b[0], b[1]);
+#pragma unroll
+            for (int jj = 0; jj < 8; ++jj) {
+                const uint32_t u = b[jj >> 2][(jj >> 1) & 1];
+                const unsigned short h = (jj & 1) ? (unsigned short)(u >> 16) : (unsigned short)(u & 0xffffu);
+                v[j][jj] = __half2float(__ushort_as_half(h));
+            }
+        }
+    }
+    // N side. Column bits: c0..c2 = lane bits 2..4, c3 = jj bit 2, c4..c6 = j bits 0..2.
+#define BF(a, b) { const float x0 = (a), x1 = (b); (a) = x0 + x1; (b) = x0 - x1; }
+#pragma unroll
+    for (int jj = 0; jj < 8; ++jj) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) if (!(j & 2)) BF(v[j][jj], v[j | 2][jj]);        // c5
+#pragma unroll
+        for (int j = 0; j < 4; ++j) BF(v[j][jj], v[j | 4][jj]);                      // c6
+#pragma unroll
+        for (int m = 4; m <= 16; m <<= 1)                                            // c0, c1, c2
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float o = __shfl_xor_sync(0xffffffffu, v[j][jj], m);
+                v[j][jj] = (lane & m) ? o - v[j][jj] : v[j][jj] + o;
+            }
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+#pragma unroll
+        for (int jj = 0; jj < 4; ++jj) BF(v[j][jj], v[j][jj | 4]);                   // c3
+#pragma unroll
+    for (int j = 0; j < 8; j += 2)
+#pragma unroll
+        for (int jj = 0; jj < 8; ++jj) BF(v[j][jj], v[j | 1][jj]);                   // c4
+    // K side per 64-column half (c6 = half). s32 [row][col ^ 8 g(row)], g = (r1 ^ r3) + 2 (r2 ^ r4).
+    const int c = lane & 7, r3 = (lane >> 3) & 1, r4 = lane >> 4;
+#pragma unroll
+    for (int hf = 0; hf < 2; ++hf) {
+#pragma unroll
+        for (int t = 0; t < 4; ++t)
+#pragma unroll
+            for (int jj = 0; jj < 8; ++jj) {
+                const int row = warp * 16 + value_row(lane, jj), col = 16 * t + value_col(lane, jj);
+                const int g = (((row >> 1) ^ (row >> 3)) & 1) | ((((row >> 2) ^ (row >> 4)) & 1) << 1);
+                s32[row * 64 + (col ^ (8 * g))] = v[4 * hf + t][jj];
+            }
+        __syncthreads();
+        float u[32];                     // i bits: r5 r6 r0 r1 r2; column 8 warp + c, row bits r3 r4 from the lane
+        const int col = warp * 8 + c;
+#pragma unroll
+        for (int i = 0; i < 32; ++i) {
+            const int row = ((i >> 2) & 7) + 8 * r3 + 16 * r4 + 32 * (i & 1) + 64 * ((i >> 1) & 1);
+            const int g = (((row >> 1) ^ (row >> 3)) & 1) | ((((row >> 2) ^ (row >> 4)) & 1) << 1);
+            u[i] = s32[row * 64 + (col ^ (8 * g))];
+        }
+#pragma unroll
+        for (int bit = 1; bit < 32; bit <<= 1)                                       // r5, r6, r0, r1, r2
+#pragma unroll
+            for (int i = 0; i < 32; ++i) if (!(i & bit)) BF(u[i], u[i | bit]);
+#pragma unroll
+        for (int m = 8; m <= 16; m <<= 1)                                            // r3, r4
+#pragma unroll
+            for (int i = 0; i < 32; ++i) {
+                const float o = __shfl_xor_sync(0xffffffffu, u[i], m);
+                u[i] = (lane & m) ? o - u[i] : u[i] + o;
+            }
+        unsigned short* s16h = reinterpret_cast<unsigned short*>(s16);
+#pragma unroll
+        for (int i = 0; i < 32; ++i) {
+            const int row = ((i >> 2) & 7) + 8 * r3 + 16 * r4 + 32 * (i & 1) + 64 * ((i >> 1) & 1);
+            const float f = u[i] * (HAD_SCALE * HAD_SCALE) * __half2float(suh[by * 128 + row]);
+            unsigned short h;
+            if constexpr (std::is_same<OutT, half>::value) h = __half_as_ushort(__float2half_rn(f));
+            else h = __bfloat16_as_ushort(__float2bfloat16_rn(f));
+            const int word = (col >> 1) ^ (4 * (r3 + 2 * r4));                       // g'(row) = r3 + 2 r4
+            s16h[row * 64 + 2 * word + (col & 1)] = h;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int it = 0; it < 4; ++it) {
+            const int id = it * 256 + threadIdx.x, row = id >> 3, vec = id & 7;
+            const uint4 q = *reinterpret_cast<const uint4*>(s16 + row * 32 + 4 * (vec ^ ((row >> 3) & 3)));
+            *reinterpret_cast<uint4*>(W + (int64_t)(by * 128 + row) * N + bx * 128 + 64 * hf + 8 * vec) = q;
+        }
+    }
+#undef BF
+}
+
 int dtype_of(const at::Tensor& t) {
     return t.scalar_type() == at::kFloat ? F32 : t.scalar_type() == at::kBFloat16 ? BF16 : F16;
 }
@@ -343,6 +515,59 @@ void exl3_unpack_cuda(const at::Tensor& T, at::Tensor& W, int64_t stride_k, int6
         unpack_kernel<K2_, CB_><<<grid, 32, 0, stream>>>(reinterpret_cast<const uint32_t*>(T.data_ptr()),         \
                                                         reinterpret_cast<half*>(W.data_ptr()), N, stride_k,      \
                                                         stride_nb);                                              \
+        C10_CUDA_KERNEL_LAUNCH_CHECK();                                                                          \
+        return;                                                                                                  \
+    }
+    TF_EXL3_ALL(TF_LAUNCH)
+#undef TF_LAUNCH
+    TORCH_CHECK(false, "unsupported EXL3 width/codebook: K2=", K2, " codebook=", cb);
+}
+
+void exl3_unpack_fold_cuda(const at::Tensor& T, const at::Tensor& suh, at::Tensor& W, int64_t stride_k,
+                           int64_t stride_nb, int64_t K2, int64_t cb) {
+    const int K = (int)W.size(0), N = (int)W.size(1);
+    dim3 grid((unsigned)(N / 128), (unsigned)(K / 128));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    constexpr int SMEM = 128 * 129 * 4;
+#define TF_LAUNCH(K2_, CB_)                                                                                         \
+    if (K2 == K2_ && cb == CB_) {                                                                                \
+        if (W.scalar_type() == at::kBFloat16) {                                                                  \
+            auto kernel = unpack_fold_kernel<K2_, CB_, __nv_bfloat16>;                                           \
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);                     \
+            kernel<<<grid, 256, SMEM, stream>>>(reinterpret_cast<const uint32_t*>(T.data_ptr()),                 \
+                                                reinterpret_cast<const half*>(suh.data_ptr()),                   \
+                                                reinterpret_cast<__nv_bfloat16*>(W.data_ptr()), N, stride_k,     \
+                                                stride_nb);                                                      \
+        } else {                                                                                                 \
+            auto kernel = unpack_fold_kernel<K2_, CB_, half>;                                                    \
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);                     \
+            kernel<<<grid, 256, SMEM, stream>>>(reinterpret_cast<const uint32_t*>(T.data_ptr()),                 \
+                                                reinterpret_cast<const half*>(suh.data_ptr()),                   \
+                                                reinterpret_cast<half*>(W.data_ptr()), N, stride_k, stride_nb);  \
+        }                                                                                                        \
+        C10_CUDA_KERNEL_LAUNCH_CHECK();                                                                          \
+        return;                                                                                                  \
+    }
+    TF_EXL3_ALL(TF_LAUNCH)
+#undef TF_LAUNCH
+    TORCH_CHECK(false, "unsupported EXL3 width/codebook: K2=", K2, " codebook=", cb);
+}
+
+void exl3_unpack_fold2_cuda(const at::Tensor& T, const at::Tensor& suh, at::Tensor& W, int64_t stride_k,
+                            int64_t stride_nb, int64_t K2, int64_t cb) {
+    const int K = (int)W.size(0), N = (int)W.size(1);
+    dim3 grid((unsigned)(N / 128), (unsigned)(K / 128));
+    auto stream = at::cuda::getCurrentCUDAStream();
+#define TF_LAUNCH(K2_, CB_)                                                                                         \
+    if (K2 == K2_ && cb == CB_) {                                                                                \
+        if (W.scalar_type() == at::kBFloat16)                                                                    \
+            unpack_fold2_kernel<K2_, CB_, __nv_bfloat16><<<grid, 256, 0, stream>>>(                              \
+                reinterpret_cast<const uint32_t*>(T.data_ptr()), reinterpret_cast<const half*>(suh.data_ptr()),  \
+                reinterpret_cast<__nv_bfloat16*>(W.data_ptr()), N, stride_k, stride_nb);                         \
+        else                                                                                                     \
+            unpack_fold2_kernel<K2_, CB_, half><<<grid, 256, 0, stream>>>(                                       \
+                reinterpret_cast<const uint32_t*>(T.data_ptr()), reinterpret_cast<const half*>(suh.data_ptr()),  \
+                reinterpret_cast<half*>(W.data_ptr()), N, stride_k, stride_nb);                                  \
         C10_CUDA_KERNEL_LAUNCH_CHECK();                                                                          \
         return;                                                                                                  \
     }

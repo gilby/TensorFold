@@ -105,12 +105,20 @@ its rows independent — which is the verify path's contract (`docs/recipes/cuda
 
 ## Prompts
 
-Prompt chunks take their own arithmetic, as the MLX 4-bit path's prompt matmul does (`cuda/exl3/prefill.py`): the
-input rotation is decode's, W_q is decoded once a chunk into fp16, a fixed-tile fp16 GEMM with fp32 accumulation
-multiplies it, and its epilogue rotates each 128-column block (the accumulator's bf16 high and low halves times
-H) before `svh` and the bias. Tiles depend on the shape alone, so a row's bits never depend on its chunk and a
-resumed prompt equals a fresh one; they differ from decode's, so the engines keep prompt ends and prefill a reply
-again, as for the MLX checkpoints. A family's head, read one row a prompt, keeps the decode linear.
+Prompt chunks take their own arithmetic, as the MLX 4-bit path's prompt matmul does (`cuda/exl3/prefill.py`). A
+family whose prompt rows are bf16 can opt in to the folded path with `Workspace(fold=True)`, as the 27B does: each
+call decodes W'' = diag(suh) H W_q H / 128, both rotations folded into the weights and rounded once to bf16
+(`unpack_fold2`), and a fixed-tile bf16 GEMM with fp32 accumulation multiplies the raw rows by it before `svh` and
+the bias, so no `rot_in` pass runs. Otherwise the input rotation is decode's, W_q is decoded once a call into fp16, a
+fixed-tile fp16 GEMM with fp32 accumulation multiplies it, and its epilogue rotates each 128-column block (the
+accumulator's bf16 high and low halves times H) before `svh` and the bias. Either way tiles depend on the shape
+alone, so a row's bits never depend on its chunk and a resumed prompt equals a fresh one; they differ from decode's,
+so the engines keep prompt ends and prefill a reply again, as for the MLX checkpoints. A family's head, read one row
+a prompt, keeps the decode linear.
+
+Switches, read at import: `TENSORFOLD_EXL3_FOLD=0` puts every family on the W_q path; `TENSORFOLD_EXL3_FOLD_BF16=0`
+keeps W'' in fp16 and rounds the rows to fp16 in the GEMM; `TENSORFOLD_EXL3_FOLD2=0` decodes W'' with `unpack_fold`,
+the plain kernel `unpack_fold2` reproduces bit for bit.
 
 ## Numbers
 

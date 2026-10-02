@@ -6,6 +6,8 @@ void exl3_linear_cuda(const at::Tensor&, const at::Tensor&, int64_t, int64_t, co
                       const c10::optional<at::Tensor>&, at::Tensor&, const c10::optional<at::Tensor>&, at::Tensor&,
                       int64_t, int64_t, int64_t, int64_t);
 void exl3_unpack_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
+void exl3_unpack_fold_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
+void exl3_unpack_fold2_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 
 static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
@@ -67,7 +69,36 @@ void unpack(const at::Tensor& T, at::Tensor W, int64_t stride_k, int64_t stride_
     exl3_unpack_cuda(T, W, stride_k, stride_nb, K2, cb);
 }
 
+static void check_fold(const at::Tensor& T, const at::Tensor& suh, const at::Tensor& W, int64_t K2) {
+    check(T, at::kInt, "T");
+    check(suh, at::kHalf, "suh");
+    TORCH_CHECK(W.is_cuda() && W.is_contiguous() &&
+                    (W.scalar_type() == at::kHalf || W.scalar_type() == at::kBFloat16),
+                "W: contiguous fp16 or bf16");
+    TORCH_CHECK(W.dim() == 2 && W.size(0) % 128 == 0 && W.size(1) % 128 == 0, "W must be [K, N], multiples of 128");
+    TORCH_CHECK(suh.numel() == W.size(0), "suh must have K elements");
+    TORCH_CHECK(T.numel() == W.numel() * K2 / 64, "T must hold K * N * bits / 32 words");
+}
+
+// W'' [K, N] fp16 or bf16 = diag(suh) Hk W_q Hn / 128: the prompt GEMM's weights with both rotations folded in.
+void unpack_fold(const at::Tensor& T, const at::Tensor& suh, at::Tensor W, int64_t stride_k, int64_t stride_nb,
+                 int64_t K2, int64_t cb) {
+    check_fold(T, suh, W, K2);
+    c10::cuda::CUDAGuard guard(T.device());
+    exl3_unpack_fold_cuda(T, suh, W, stride_k, stride_nb, K2, cb);
+}
+
+// The same W'', bit for bit, from unpack_fold2_kernel (the N side in registers, two blocks an SM).
+void unpack_fold2(const at::Tensor& T, const at::Tensor& suh, at::Tensor W, int64_t stride_k, int64_t stride_nb,
+                  int64_t K2, int64_t cb) {
+    check_fold(T, suh, W, K2);
+    c10::cuda::CUDAGuard guard(T.device());
+    exl3_unpack_fold2_cuda(T, suh, W, stride_k, stride_nb, K2, cb);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("unpack_fold", &unpack_fold);
+    m.def("unpack_fold2", &unpack_fold2);
     m.def("rot_in", &rot_in);
     m.def("linear", &linear);
     m.def("unpack", &unpack);

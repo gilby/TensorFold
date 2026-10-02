@@ -267,6 +267,168 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
     }
 }
 
+// 17-128 rows (the mid-M kernels): each CTA takes one 16 P-row group of one column block (G = ceil(M / 16 P) CTAs a
+// block, side by side in the grid, so a block's CTAs read its words from L2 together) and decodes every k step's tiles
+// once for its P 16-row passes. The warps keep linear_kernel's K ranges, mma chain and warp-order sums, and the split
+// fold is the same: every output bit equals linear_kernel's at any row count.
+template <int K2, int CB, int WK, int P>
+__global__ void __launch_bounds__(WK * 32) linear_mpg_kernel(
+    const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
+    const half* __restrict__ svh, const half* __restrict__ bias, int has_bias, void* __restrict__ y, int y_dtype,
+    float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK) {
+    constexpr int TW = tile_words<K2>();
+    constexpr int LW = lane_words<K2>();
+    extern __shared__ __align__(16) float red[];              // WK * RH * 128 floats
+    __shared__ int last;
+    const int RH = min(M, 8);                                 // rows of red a warp
+
+    const int G = (M + 16 * P - 1) / (16 * P), grp = blockIdx.x % G, nb = blockIdx.x / G, split = blockIdx.y, NB = gridDim.x / G;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int per_warp = (K >> 4) / SK / WK;
+    const int kt0 = split * (per_warp * WK) + warp * per_warp;
+    const uint32_t* tiles = T + nb * stride_nb;
+    const int col0 = nb * 128;
+    bool prev = false;
+    if constexpr (step_shuffled<K2>()) {
+        int word, offset;
+        lane_start<K2>(lane, word, offset);
+        prev = word != lane / (8 / K2);
+    }
+
+    for (int mg = grp * 16 * P, pg = grp * P; mg < M && mg < (grp + 1) * 16 * P; mg += 16 * P, pg += P) {
+        float acc[P][8][2][4];
+#pragma unroll
+        for (int q = 0; q < P; ++q)
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+#pragma unroll
+                for (int h = 0; h < 2; ++h)
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) acc[q][i][h][c] = 0.f;
+
+        // each pass's rows for the mma, clamped inside the buffer (rows past M are computed and dropped)
+        const half* x0[P];
+        const half* x1[P];
+#pragma unroll
+        for (int q = 0; q < P; ++q) {
+            const int mq = min(mg + 16 * q, M - 1), Rq = max(1, min(16, M - mq));
+            const int r0 = mq + (g < Rq ? g : Rq - 1), r1 = mq + (g + 8 < Rq ? g + 8 : Rq - 1);
+            x0[q] = xh + (size_t)r0 * K;
+            x1[q] = xh + (size_t)r1 * K;
+        }
+        const uint32_t* tile = tiles + (size_t)kt0 * stride_k;
+        // up to 6 bits the next k step's words are loaded while this one is decoded; 7 and 8 bits load per tile
+        constexpr bool PF = K2 <= 12;
+        constexpr int SR = step_regs<K2>();
+        uint32_t cur[PF ? SR : 1], nxt[PF ? SR : 1];
+        if constexpr (PF) load_step<K2>(tile, lane, cur);
+#pragma unroll 1
+        for (int i = 0; i < per_warp; ++i) {
+            const int kt = kt0 + i;
+            uint32_t a[P][4];
+#pragma unroll
+            for (int q = 0; q < P; ++q) {
+                a[q][0] = __ldg(reinterpret_cast<const uint32_t*>(x0[q] + kt * 16 + 2 * t));
+                a[q][1] = __ldg(reinterpret_cast<const uint32_t*>(x1[q] + kt * 16 + 2 * t));
+                a[q][2] = __ldg(reinterpret_cast<const uint32_t*>(x0[q] + kt * 16 + 2 * t + 8));
+                a[q][3] = __ldg(reinterpret_cast<const uint32_t*>(x1[q] + kt * 16 + 2 * t + 8));
+            }
+            if constexpr (PF) {
+                if (i + 1 < per_warp) load_step<K2>(tile + (size_t)(i + 1) * stride_k, lane, nxt);
+            }
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                uint32_t w[LW];
+                if constexpr (PF) step_lane_words<K2>(cur, j, lane, prev, w);
+                else ldg_lane_words<K2>(tile + (size_t)i * stride_k + j * TW, lane, w);
+                uint32_t b0[2], b1[2];
+                decode_lane<K2, CB>(w, lane, b0, b1);
+#pragma unroll
+                for (int q = 0; q < P; ++q) {
+                    mma16816(acc[q][j][0], a[q], b0);
+                    mma16816(acc[q][j][1], a[q], b1);
+                }
+            }
+            if constexpr (PF) {
+#pragma unroll
+                for (int q = 0; q < SR; ++q) cur[q] = nxt[q];
+            }
+        }
+
+#pragma unroll
+        for (int q = 0; q < P; ++q) {
+        const int m0 = mg + 16 * q, pass = pg + q;
+        if (m0 >= M) break;
+        const int R = min(16, M - m0);
+        // the warps' sums, added in warp order, rows 0-7 of the pass and then rows 8-15
+        for (int rlo = 0; rlo < R; rlo += 8) {
+            const int rn = min(R - rlo, 8);
+            __syncthreads();                         // red is reused by every half and pass
+            if (g < RH) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i)
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const int col = i * 16 + h * 8 + 2 * t;
+                        *reinterpret_cast<float2*>(red + (warp * RH + g) * 128 + col) =
+                            rlo ? make_float2(acc[q][i][h][2], acc[q][i][h][3]) : make_float2(acc[q][i][h][0], acc[q][i][h][1]);
+                    }
+            }
+            __syncthreads();
+
+            if (SK == 1) {
+                for (int r = warp; r < rn; r += WK) {
+                    float v[4];
+                    const float4 u = *reinterpret_cast<const float4*>(red + r * 128 + 4 * lane);
+                    v[0] = u.x; v[1] = u.y; v[2] = u.z; v[3] = u.w;
+#pragma unroll
+                    for (int w = 1; w < WK; ++w) {
+                        const float4 q = *reinterpret_cast<const float4*>(red + (w * RH + r) * 128 + 4 * lane);
+                        v[0] += q.x; v[1] += q.y; v[2] += q.z; v[3] += q.w;
+                    }
+                    finish(v, lane, svh, bias, has_bias, col0 + 4 * lane);
+                    store4(y, y_dtype, (size_t)(m0 + rlo + r) * N + col0 + 4 * lane, v);
+                }
+            } else {
+                for (int idx = threadIdx.x; idx < rn * 32; idx += WK * 32) {
+                    const int r = idx >> 5, c = 4 * (idx & 31);
+                    float4 s = *reinterpret_cast<const float4*>(red + r * 128 + c);
+#pragma unroll
+                    for (int w = 1; w < WK; ++w) {
+                        const float4 q = *reinterpret_cast<const float4*>(red + (w * RH + r) * 128 + c);
+                        s.x += q.x; s.y += q.y; s.z += q.z; s.w += q.w;
+                    }
+                    *reinterpret_cast<float4*>(Z + ((size_t)split * M + m0 + rlo + r) * N + col0 + c) = s;
+                }
+            }
+        }
+        if (SK > 1) {
+            __threadfence();
+            __syncthreads();
+            if (threadIdx.x == 0) last = atomicAdd(counters + pass * NB + nb, 1) == SK - 1;
+            __syncthreads();
+            if (last) {
+                __threadfence();
+                for (int r = warp; r < R; r += WK) {
+                    const size_t at = ((size_t)m0 + r) * N + col0 + 4 * lane;
+                    float4 s = __ldcg(reinterpret_cast<const float4*>(Z + at));
+                    for (int q = 1; q < SK; ++q) {
+                        const float4 u = __ldcg(reinterpret_cast<const float4*>(Z + (size_t)q * M * N + at));
+                        s.x += u.x; s.y += u.y; s.z += u.z; s.w += u.w;
+                    }
+                    float v[4] = {s.x, s.y, s.z, s.w};
+                    finish(v, lane, svh, bias, has_bias, col0 + 4 * lane);
+                    store4(y, y_dtype, (size_t)(m0 + r) * N + col0 + 4 * lane, v);
+                }
+                if (threadIdx.x == 0) counters[pass * NB + nb] = 0;   // every program of the block has arrived
+            }
+        }
+        }
+        __syncthreads();                             // red is reused in the next pass
+    }
+}
+
 // W_q [K, N] fp16 from the trellis words (tile (kt, nt) at kt * stride_k + (nt / 8) * stride_nb): one warp per tile.
 template <int K2, int CB>
 __global__ void __launch_bounds__(32) unpack_kernel(const uint32_t* __restrict__ T, half* __restrict__ W, int N,
@@ -476,7 +638,7 @@ void exl3_rot_in_cuda(const at::Tensor& x, const at::Tensor& suh, at::Tensor& xh
 void exl3_linear_cuda(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int64_t stride_nb,
                       const at::Tensor& svh, const c10::optional<at::Tensor>& bias, at::Tensor& y,
                       const c10::optional<at::Tensor>& Z, at::Tensor& counters, int64_t K2, int64_t cb, int64_t SK,
-                      int64_t WK) {
+                      int64_t WK, int64_t mode) {
     const int M = (int)xh.size(0), K = (int)xh.size(1), N = (int)y.size(1);
     TORCH_CHECK(WK == 2 || WK == 4 || WK == 8, "WK must be 2, 4 or 8");
     TORCH_CHECK((K / 16) % (SK * WK) == 0, "K / 16 must split evenly over SK * WK warps");
@@ -487,11 +649,20 @@ void exl3_linear_cuda(const at::Tensor& xh, const at::Tensor& T, int64_t stride_
     const int has_bias = bias ? 1 : 0;
     float* zptr = Z ? Z->data_ptr<float>() : nullptr;
     TORCH_CHECK(SK == 1 || zptr, "Z is needed with more than one split");
+    constexpr int MIDM = 6;                       // mode: 0 linear_kernel at every row count, 6 the mid-M kernels
 #define TF_LAUNCH(K2_, CB_)                                                                                        \
     if (K2 == K2_ && cb == CB_) {                                                                               \
         auto kernel = WK == 2 ? linear_kernel<K2_, CB_, 2>                                                      \
                               : WK == 4 ? linear_kernel<K2_, CB_, 4> : linear_kernel<K2_, CB_, 8>;              \
         const int smem = (int)(WK * std::min(M, 8) * 128 * sizeof(float));                                \
+        if (mode >= MIDM && M > 16) {          /* 17-48 rows: 16-row groups; 49-128: 32-row groups */          \
+            const bool p2 = M > 48;                                                                              \
+            kernel = p2 ? (WK == 2 ? linear_mpg_kernel<K2_, CB_, 2, 2>                                           \
+                                   : WK == 4 ? linear_mpg_kernel<K2_, CB_, 4, 2> : linear_mpg_kernel<K2_, CB_, 8, 2>) \
+                        : (WK == 2 ? linear_mpg_kernel<K2_, CB_, 2, 1>                                           \
+                                   : WK == 4 ? linear_mpg_kernel<K2_, CB_, 4, 1> : linear_mpg_kernel<K2_, CB_, 8, 1>); \
+            grid.x = (unsigned)((N / 128) * ((M + (p2 ? 31 : 15)) / (p2 ? 32 : 16)));                           \
+        }                                                                                                        \
         if (smem > 48 * 1024) cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); \
         kernel<<<grid, (unsigned)(WK * 32), smem, stream>>>(                                              \
             reinterpret_cast<const half*>(xh.data_ptr()), reinterpret_cast<const uint32_t*>(T.data_ptr()),      \

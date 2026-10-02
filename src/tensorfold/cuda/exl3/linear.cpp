@@ -4,7 +4,7 @@
 void exl3_rot_in_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&);
 void exl3_linear_cuda(const at::Tensor&, const at::Tensor&, int64_t, int64_t, const at::Tensor&,
                       const c10::optional<at::Tensor>&, at::Tensor&, const c10::optional<at::Tensor>&, at::Tensor&,
-                      int64_t, int64_t, int64_t, int64_t);
+                      int64_t, int64_t, int64_t, int64_t, int64_t);
 void exl3_unpack_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 void exl3_unpack_fold_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 void exl3_unpack_fold2_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
@@ -34,9 +34,10 @@ void rot_in(const at::Tensor& x, const at::Tensor& suh, at::Tensor xh) {
 }
 
 // y [M, N] = (xh @ W_q) @ H * svh + bias; Z [SK, M, N] fp32 when SK > 1; counters int32 [8 * N / 128], left zero.
+// mode picks the kernel for 17-128 rows (0: linear_kernel; 6: the mid-M kernels); every mode gives the same bits.
 void linear(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int64_t stride_nb, const at::Tensor& svh,
             const c10::optional<at::Tensor>& bias, at::Tensor y, const c10::optional<at::Tensor>& Z,
-            at::Tensor counters, int64_t K2, int64_t cb, int64_t SK, int64_t WK) {
+            at::Tensor counters, int64_t K2, int64_t cb, int64_t SK, int64_t WK, int64_t mode) {
     check(xh, at::kHalf, "xh");
     check_io(y, "y");
     check(svh, at::kHalf, "svh");
@@ -56,7 +57,7 @@ void linear(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int64_t
         TORCH_CHECK(Z->numel() >= SK * M * N, "Z too small");
     }
     c10::cuda::CUDAGuard guard(xh.device());
-    exl3_linear_cuda(xh, T, stride_k, stride_nb, svh, bias, y, Z, counters, K2, cb, SK, WK);
+    exl3_linear_cuda(xh, T, stride_k, stride_nb, svh, bias, y, Z, counters, K2, cb, SK, WK, mode);
 }
 
 // W [K, N] fp16 = W_q, the trellis tiles decoded; tile (kt, nt) at kt * stride_k + (nt / 8) * stride_nb words.

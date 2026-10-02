@@ -103,6 +103,12 @@ into tensor-core fragments and multiplies in fp32. Rows are independent by const
 and of K splits depend only on (K, N) (`plan(k, n)`), every sum runs in a fixed order, and `mma.m16n8k16` keeps
 its rows independent — which is the verify path's contract (`docs/recipes/cuda.md`).
 
+`linear_kernel` runs 16 rows a pass and decodes every tile again each pass, so from 17 rows (verify windows of several
+streams) the mid-M kernels take the call: each CTA holds 16 rows (17-48) or 32 (49-128) of one column block, and the
+CTAs of a block sit side by side in the grid so they read its words from L2 together. They keep `linear_kernel`'s K
+ranges, mma chain and fixed-order sums, so every output bit is the same at any row count; `TENSORFOLD_EXL3_MIDM=0`
+keeps `linear_kernel` throughout.
+
 ## Prompts
 
 Prompt chunks take their own arithmetic, as the MLX 4-bit path's prompt matmul does (`cuda/exl3/prefill.py`). A

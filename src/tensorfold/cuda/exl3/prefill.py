@@ -92,6 +92,7 @@ FOLD_TILES = {
 FOLD = os.environ.get("TENSORFOLD_EXL3_FOLD", "1") != "0"            # 0: every family on the W_q path
 FOLD_BF16 = os.environ.get("TENSORFOLD_EXL3_FOLD_BF16", "1") != "0"  # 0: fp16 W'' (and fp16 rows in the GEMM)
 FOLD2 = os.environ.get("TENSORFOLD_EXL3_FOLD2", "1") != "0"          # 0: unpack_fold, the same bits, slower
+SCOPE: list | None = None            # layer-major prefill: the layers whose W'' is held now (None: none is held)
 
 
 def tiles_fold(k: int, n: int) -> tuple[int, int, int, int, int, int]:
@@ -102,6 +103,26 @@ def tiles_fold(k: int, n: int) -> tuple[int, int, int, int, int, int]:
     if n % 256 == 0 and k % 64 == 0 and (k >= 6144 or n >= 6144):
         return 128, 256, 64, 8, 3, 8
     return 128, 128, 32, 8, 4, 8
+
+
+def scope_begin() -> None:
+    """Hold each W'' a folded call decodes until ``scope_release`` (a layer-major prefill: one layer at a time)."""
+
+    global SCOPE
+    SCOPE = []
+
+
+def scope_release() -> None:
+    if SCOPE:
+        for layer in SCOPE:
+            layer._prompt_w = None
+        SCOPE.clear()
+
+
+def scope_end() -> None:
+    global SCOPE
+    scope_release()
+    SCOPE = None
 
 
 class Workspace:
@@ -140,9 +161,16 @@ def matmul(layer: Exl3Linear, x: torch.Tensor, out: torch.Tensor, ws: Workspace)
         raise ValueError(f"prefill matmul: x {tuple(x.shape)} and out {tuple(out.shape)} do not match K={k}, N={n}")
     ext = _ext()
     if FOLD and ws.fold and out.dtype == torch.bfloat16 and x.dtype == torch.bfloat16:
-        wq = ws._grow("w", k * n, x.device)[:k * n].view(k, n).view(torch.bfloat16 if FOLD_BF16 else torch.float16)
-        (ext.unpack_fold2 if FOLD2 else ext.unpack_fold)(layer.words, layer.suh, wq, *layer.strides, layer.k2,
-                                                         CODEBOOK_IDS[layer.codebook])
+        wq = getattr(layer, "_prompt_w", None) if SCOPE is not None else None
+        if wq is None:
+            wdt = torch.bfloat16 if FOLD_BF16 else torch.float16
+            wq = (torch.empty((k, n), device=x.device, dtype=wdt) if SCOPE is not None
+                  else ws._grow("w", k * n, x.device)[:k * n].view(k, n).view(wdt))
+            (ext.unpack_fold2 if FOLD2 else ext.unpack_fold)(layer.words, layer.suh, wq, *layer.strides, layer.k2,
+                                                             CODEBOOK_IDS[layer.codebook])
+            if SCOPE is not None:                  # held for the layer's other chunks
+                layer._prompt_w = wq
+                SCOPE.append(layer)
         bm, bn, bk, warps, stages, group = tiles_fold(k, n)
         bias = layer.bias if layer.bias is not None else layer.svh
         x = x if x.stride(1) == 1 and x.stride(0) == k else x.contiguous()

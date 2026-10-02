@@ -95,7 +95,7 @@ class FlashNextEngine:
             raise ValueError(f"MTP drafts a round: 0 to {MAX_DEPTH}, not {depth}")
         if not 0.0 <= float(confidence) <= 1.0:
             raise ValueError(f"MTP draft confidence: a probability from 0 to 1, not {confidence}")
-        torch.cuda.set_device(0)
+        __import__("tensorfold.cuda.device", fromlist=["select"]).select(torch)
         self.tp, self.rank, self.depth, self.confidence = tp, rank, int(depth), float(confidence)
         # copy drafts (copy_drafts.py): on unless TENSORFOLD_COPY_DRAFTS=0, and never without MTP drafts
         self.copy_drafts = bool(self.depth > 0 and copy_enabled(True if copy_drafts is None else bool(copy_drafts)))

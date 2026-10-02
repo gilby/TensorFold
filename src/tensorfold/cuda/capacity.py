@@ -152,7 +152,7 @@ def unified(torch) -> bool:
     """A GPU on the host's memory (GB10): its free figure is MemFree, which counts the page cache as used."""
 
     try:
-        return bool(torch.cuda.get_device_properties(0).is_integrated)
+        return bool(torch.cuda.get_device_properties(torch.cuda.current_device()).is_integrated)
     except (AttributeError, AssertionError, RuntimeError):
         return False
 
@@ -286,11 +286,13 @@ def choose(plan: Plan, peers: list[list[int]] | None = None) -> int:
 
 
 def floor(model_dir: str | Path) -> tuple[int, int]:
-    """The compute capability a checkpoint's kernels need: 8.9 for every format (clusters are taken where present)."""
+    """The compute capability a checkpoint's kernels need: 8.0 with bf16 prompts for every format (NVFP4 runs W4A16
+    and FP8 layers dequantized where the GPU has no FP4 / FP8 MMA), 8.9 for FP8 prompts (clusters where present)."""
 
-    from tensorfold.cuda import build
+    from tensorfold.cuda import build, prompt_precision
 
-    return build.MIN_CAPABILITY
+    # NVFP4 / FP8 checkpoints run W4A16 / dequantized FP8 below 8.9 (precision.own_math): only FP8 prompts need 8.9
+    return build.FP8 if prompt_precision.fp8() else build.MIN_CAPABILITY
 
 
 def admit(model_dir: str | Path, requested: int | None, explicit: bool | None, torch,

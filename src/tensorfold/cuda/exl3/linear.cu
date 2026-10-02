@@ -51,14 +51,15 @@ __device__ __forceinline__ void store4(void* p, int dtype, size_t i, const float
 }
 
 // The finished outputs of one row's 128 columns from their fp32 sums (4 a lane): H / sqrt(128), * svh, + bias.
-__device__ __forceinline__ void finish(float (&v)[4], int lane, const half* svh, const half* bias, int col) {
+// ``bias`` is never null (no bias: the host passes svh with has_bias 0), so a load the compiler hoists above the
+// test stays inside an allocation: nvcc did exactly that for sm_86 (a null-pointer read on A40, never on sm_121).
+__device__ __forceinline__ void finish(float (&v)[4], int lane, const half* svh, const half* bias, int has_bias,
+                                       int col) {
     fwht128(v, lane);
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         v[j] = v[j] * HAD_SCALE * __half2float(__ldg(svh + col + j));
-        // Speculative loads must have a valid address even when the split-K result has no bias.
-        const half bv = __ldg((bias ? bias : svh) + col + j);
-        if (bias) v[j] += __half2float(bv);
+        if (has_bias) v[j] += __half2float(__ldg(bias + col + j));
     }
 }
 
@@ -128,7 +129,7 @@ __global__ void __launch_bounds__(128) rot_in_kernel(const void* __restrict__ x,
 template <int K2, int CB, int WK>
 __global__ void __launch_bounds__(WK * 32) linear_kernel(
     const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
-    const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
+    const half* __restrict__ svh, const half* __restrict__ bias, int has_bias, void* __restrict__ y, int y_dtype,
     float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK) {
     constexpr int TW = tile_words<K2>();
     constexpr int LW = lane_words<K2>();
@@ -224,7 +225,7 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
                         const float4 q = *reinterpret_cast<const float4*>(red + (w * RH + r) * 128 + 4 * lane);
                         v[0] += q.x; v[1] += q.y; v[2] += q.z; v[3] += q.w;
                     }
-                    finish(v, lane, svh, bias, col0 + 4 * lane);
+                    finish(v, lane, svh, bias, has_bias, col0 + 4 * lane);
                     store4(y, y_dtype, (size_t)(m0 + rlo + r) * N + col0 + 4 * lane, v);
                 }
             } else {
@@ -255,7 +256,7 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
                         s.x += u.x; s.y += u.y; s.z += u.z; s.w += u.w;
                     }
                     float v[4] = {s.x, s.y, s.z, s.w};
-                    finish(v, lane, svh, bias, col0 + 4 * lane);
+                    finish(v, lane, svh, bias, has_bias, col0 + 4 * lane);
                     store4(y, y_dtype, (size_t)(m0 + r) * N + col0 + 4 * lane, v);
                 }
                 if (threadIdx.x == 0) counters[pass * NB + nb] = 0;   // every program of the block has arrived
@@ -309,7 +310,9 @@ void exl3_linear_cuda(const at::Tensor& xh, const at::Tensor& T, int64_t stride_
     TORCH_CHECK((K / 16) % (SK * WK) == 0, "K / 16 must split evenly over SK * WK warps");
     dim3 grid((unsigned)(N / 128), (unsigned)SK);
     auto stream = at::cuda::getCurrentCUDAStream();
-    const half* bptr = bias ? reinterpret_cast<const half*>(bias->data_ptr()) : nullptr;
+    // no bias: svh stands in (N halves, the same columns), so the kernel never holds a null pointer
+    const half* bptr = reinterpret_cast<const half*>(bias ? bias->data_ptr() : svh.data_ptr());
+    const int has_bias = bias ? 1 : 0;
     float* zptr = Z ? Z->data_ptr<float>() : nullptr;
     TORCH_CHECK(SK == 1 || zptr, "Z is needed with more than one split");
 #define TF_LAUNCH(K2_, CB_)                                                                                        \
@@ -320,7 +323,7 @@ void exl3_linear_cuda(const at::Tensor& xh, const at::Tensor& T, int64_t stride_
         if (smem > 48 * 1024) cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); \
         kernel<<<grid, (unsigned)(WK * 32), smem, stream>>>(                                              \
             reinterpret_cast<const half*>(xh.data_ptr()), reinterpret_cast<const uint32_t*>(T.data_ptr()),      \
-            stride_k, stride_nb, reinterpret_cast<const half*>(svh.data_ptr()), bptr, y.data_ptr(), dtype_of(y),\
+            stride_k, stride_nb, reinterpret_cast<const half*>(svh.data_ptr()), bptr, has_bias, y.data_ptr(), dtype_of(y),\
             zptr, counters.data_ptr<int>(), M, K, N, (int)SK);                                                  \
         C10_CUDA_KERNEL_LAUNCH_CHECK();                                                                         \
         return;                                                                                                 \

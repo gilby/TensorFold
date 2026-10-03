@@ -40,9 +40,9 @@ class Qwen27Engine:
 
         exl3 = quant_config(Path(model_dir)) is not None
         nvfp4 = not exl3 and is_quantized(Path(model_dir))
-        if (exl3 or nvfp4) and tp != 1:
-            raise ValueError(f"{'EXL3 packs' if exl3 else 'NVFP4 checkpoints'} of Qwen3.8-27B run on one GPU: drop "
-                             "--tp 2, or serve the MLX checkpoint (TensorFold/Qwen3.8-27B-MLX-4bit) on two")
+        if exl3 and tp != 1:
+            raise ValueError("EXL3 packs of Qwen3.8-27B run on one GPU: drop --tp 2, or serve the MLX checkpoint "
+                             "(TensorFold/Qwen3.8-27B-MLX-4bit) or an NVFP4 one on two")
         if exl3 and volta():
             raise ValueError("EXL3 packs of Qwen3.8-27B need sm_80 or newer kernels: on a Volta GPU serve an NVFP4 "
                              "checkpoint (RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead) or the MLX one")
@@ -86,6 +86,12 @@ class Qwen27Engine:
                                    "machines, and pass the same --no-drafts, --parallel, --context and "
                                    "--checkpoint-slots to both")
             gather = lambda values: gather_ints(torch, lambda send, recv: dist.all_gather_into_tensor(recv, send), values)
+            from tensorfold.cuda import p2p
+
+            if p2p.install(rank) and rank == 0:     # row-parallel sums in one launch: P2P, or shared host memory
+                print(f"[tensorfold] rank sums: {p2p.peer().kind}, NCCL for prompt-sized sums", flush=True)
+            elif rank == 0:
+                print("[tensorfold] rank sums: NCCL", flush=True)
         else:
             gather = None
         many = streams > 1
@@ -102,6 +108,10 @@ class Qwen27Engine:
             from .nvfp4_load import admission as nvfp4_admission
 
             geometry, tensor_bytes = nvfp4_admission(geometry)
+            if tp == 2:                     # each rank keeps its shard of every layer as it loads (no startup copy)
+                from .distributed import half_layers
+
+                tensor_bytes = half_layers(tensor_bytes)
         # one admission for one stream or many, on every rank, before any weight loads
         self.capacity_plan = admit(model_dir, context, context_explicit, torch,
                                    capacity_geometry(geometry, model_dir, vision, rank, offload=vision_offload),
@@ -113,15 +123,21 @@ class Qwen27Engine:
                                                                               bounded=True, streams=streams,
                                                                               kept=keep + 1 if many else 0),
                                    # sm_70 (32 GB V100s): the full checkpoint (already the resident term) is split and freed
-                                   # before caches exist; a second full copy is not part of that peak
-                                   startup_copies=int(tp == 2 and not volta()),
+                                   # before caches exist; a second full copy is not part of that peak; NVFP4 layers
+                                   # shard as they load on two ranks, so they never hold a second full copy either
+                                   startup_copies=int(tp == 2 and not nvfp4 and not volta()),
                                    # MLX and NVFP4 checkpoints run on the sm_70 kernels; EXL3 needs the shared ones
                                    need=None if exl3 or (nvfp4 and not volta()) else VOLTA,
                                    # sm_70 NVFP4: each projection repacks from its upload (the bf16 head a chunk at a
                                    # time), one extra copy of the largest tensor at most
                                    staging_copies=2 if nvfp4 and volta() else 3)
         self.context_window = self.capacity_plan["context_window"]
-        if tp == 2:
+        if tp == 2 and nvfp4:               # layers shard as they load; the embedding and head stay whole for the drafter
+            from .distributed import shard_layer
+
+            full = load(model_dir, nvfp4_layer=shard_layer(rank))
+            self.w = split_weights(full, rank, tiled=True, split_head=split_head, layers_split=True)
+        elif tp == 2:
             full = load(model_dir)
             self.w = split_weights(full, rank, tiled=True, split_head=split_head)
         else:

@@ -201,3 +201,63 @@ def test_two_process_nccl_rank_order():
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     spawn(_nccl_worker, args=(port,), nprocs=2)
+
+
+def _p2p_worker(rank: int, port: int, host: bool = False):
+    import torch.distributed as dist
+
+    from tensorfold.cuda import p2p
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2)
+    try:
+        if host:                                  # the GPUs cannot map each other: shared page-locked host memory
+            assert p2p.install(rank), "both ranks are on this machine, yet the host-memory sum was not installed"
+            assert isinstance(p2p.peer(), p2p.HostSum)
+        else:
+            assert p2p.install(rank), "both GPUs can map each other, yet the P2P sum was not installed"
+        peer = p2p.peer()
+        gen = torch.Generator(device="cuda").manual_seed(100 + rank)
+        for round_ in range(300):
+            rows = (1, 3, 16, 64, 128)[round_ % 5]
+            dtype = torch.float32 if round_ % 3 else torch.bfloat16
+            local = (torch.randn((rows, 5120), generator=gen, device="cuda") * 3).to(dtype)
+            both = torch.empty((2 * rows, 5120), dtype=dtype, device="cuda")
+            dist.all_gather_into_tensor(both, local)
+            want = (both[:rows].float() + both[rows:].float()).to(torch.bfloat16)
+            got = peer(local)
+            assert torch.equal(got, want), f"round {round_}: P2P sum differs from the rank-ordered sum"
+        torch.cuda.synchronize()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_two_process_p2p_sum_is_the_rank_ordered_sum():
+    """The P2P row-parallel sum (one launch over the peer mapping) equals gathering and adding in rank order."""
+
+    if os.environ.get("TENSORFOLD_TEST_NCCL") != "1":
+        pytest.skip("set TENSORFOLD_TEST_NCCL=1 to run the two-GPU process tests")
+    if torch.cuda.device_count() < 2 or not torch.cuda.can_device_access_peer(0, 1):
+        pytest.skip("requires two visible CUDA devices that can map each other")
+    from torch.multiprocessing import spawn
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    spawn(_p2p_worker, args=(port,), nprocs=2)
+
+
+def test_two_process_host_memory_sum_is_the_rank_ordered_sum():
+    """Without a peer mapping (PCIe GPUs in a VM: Volta's V100s) the sum runs through shared page-locked host memory:
+    the same kernel, the same bits as gathering and adding in rank order."""
+
+    if os.environ.get("TENSORFOLD_TEST_NCCL") != "1":
+        pytest.skip("set TENSORFOLD_TEST_NCCL=1 to run the two-GPU process tests")
+    if torch.cuda.device_count() < 2 or torch.cuda.can_device_access_peer(0, 1):
+        pytest.skip("requires two visible CUDA devices that cannot map each other")
+    from torch.multiprocessing import spawn
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    spawn(_p2p_worker, args=(port, True), nprocs=2)

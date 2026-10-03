@@ -72,6 +72,24 @@ class Plain:
 
         return prompt(x, self.weight)
 
+    def outputs(self, rows: torch.Tensor) -> "Plain":
+        """Column-parallel shard: the weight's ``rows`` as stored (an NVFP4 checkpoint's bf16 head and GDN gates)."""
+
+        return Plain(self.weight.index_select(0, rows.to(self.weight.device)).contiguous())
+
+    def inputs(self, rank: int, world: int = 2) -> "Plain":
+        """Row-parallel shard: half the input columns, as stored."""
+
+        if world != 2 or rank not in (0, 1) or self.k % (64 * world):
+            raise ValueError(f"bf16 weight K {self.k} does not split into two halves of whole 64-input groups")
+        half = self.k // world
+        return Plain(self.weight[:, rank * half:(rank + 1) * half].contiguous())
+
+    def partial(self, x: torch.Tensor) -> torch.Tensor:
+        """A row-parallel rank's product for the rank-ordered sum (``b16`` rounds it to bf16 first, the same bits always)."""
+
+        return self(x).float()
+
 
 @dataclass
 class Exl3:
@@ -271,7 +289,7 @@ class _Tensors:
 
 
 def load(model_dir: str | Path, device: str = "cuda", *, tiled: bool = False, mlp=None, nvfp4_mlp=None,
-         exl3_mlp=None) -> Weights:
+         exl3_mlp=None, nvfp4_layer=None) -> Weights:
     """MLX affine 4-bit (``tiled``: projections packed as read; ``mlp(prefix, get, qlinear, cfg)``: a layer's MLP fields), an EXL3 pack, or NVFP4 (``nvfp4_mlp(prefix, tensors, cfg)``)."""
 
     from .exl3_load import load_exl3, quant_config
@@ -281,7 +299,7 @@ def load(model_dir: str | Path, device: str = "cuda", *, tiled: bool = False, ml
     if quant_config(model_dir) is not None:
         return load_exl3(model_dir, device, mlp=exl3_mlp)
     if quantized(model_dir):
-        return load_nvfp4(model_dir, device, mlp=nvfp4_mlp)
+        return load_nvfp4(model_dir, device, mlp=nvfp4_mlp, layer=nvfp4_layer)
     cfg = Config.read(model_dir)
     raw = json.loads((model_dir / "config.json").read_text())
     t = _Tensors(model_dir, device)

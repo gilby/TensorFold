@@ -146,7 +146,10 @@ def test_qlinear_preserves_packed_width_and_scale_precision():
     tree = ast.parse((ROOT / "families/qwen3_5/cuda/weights.py").read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "QLinear")
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
-    namespace = {"dataclass": dataclass, "cached_property": cached_property, "torch": SimpleNamespace(bfloat16="bf16")}
+    from tensorfold.families.qwen3_5.cuda.affine_memory import LANE_FORMATS
+
+    namespace = {"dataclass": dataclass, "cached_property": cached_property, "torch": SimpleNamespace(bfloat16="bf16"),
+                 "LANE_FORMATS": LANE_FORMATS}
     module = ast.fix_missing_locations(ast.Module(body=[future, cls], type_ignores=[]))
     exec(compile(module, "affine_weight_metadata", "exec"), namespace)
     QLinear = namespace["QLinear"]
@@ -193,7 +196,10 @@ def test_loader_resolves_each_module_and_keeps_metadata_precision():
     assert not tensors
 
 
-def test_generic_memory_counts_eight_bit_words_without_four_bit_padding(tmp_path):
+@pytest.mark.parametrize("scale_dtype,stored", [("F16", 35 * 64 * 4), ("BF16", 64 * 64 * 4)], ids=["generic", "lane"])
+def test_generic_memory_counts_eight_bit_words_without_four_bit_padding(tmp_path, scale_dtype, stored):
+    """8-bit words count as stored, or as lane tiles (rows padded to 64) once bf16 scales make them a lane format."""
+
     from tensorfold.families.qwen3_5.cuda.affine_memory import weight_transform
 
     config = {"quantization": {"bits": 8, "group_size": 32}}
@@ -201,14 +207,14 @@ def test_generic_memory_counts_eight_bit_words_without_four_bit_padding(tmp_path
     prefix = "language_model.model.layers.0.self_attn.q_proj"
     entries, offset = {}, 0
     for suffix, dtype, shape, item in [("weight", "U32", [35, 64], 4),
-                                      ("scales", "BF16", [35, 8], 2), ("biases", "BF16", [35, 8], 2)]:
+                                      ("scales", scale_dtype, [35, 8], 2), ("biases", scale_dtype, [35, 8], 2)]:
         size = int(np.prod(shape)) * item
         entries[prefix + "." + suffix] = {"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + size]}
         offset += size
     raw = json.dumps(entries).encode()
     (tmp_path / "model.safetensors").write_bytes(struct.pack("<Q", len(raw)) + raw)
     transform = weight_transform(tmp_path)
-    assert transform(prefix + ".weight", entries[prefix + ".weight"]) == (35 * 64 * 4, 0)
+    assert transform(prefix + ".weight", entries[prefix + ".weight"]) == (stored, 0)
 
 
 def test_mixed_prefill_tiles_raw_fast_weights_and_preserves_fp8_dispatch():

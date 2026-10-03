@@ -7,6 +7,8 @@ import json
 import math
 from pathlib import Path
 
+LANE_FORMATS = frozenset((bits, gs) for bits in (4, 5, 6, 8) for gs in (32, 64))   # (bits, group) the lane kernels read
+
 
 def weight_transform(model_dir, *, one_gpu: bool = False):
     """Tensor bytes; the head counts twice (the drafter's copy), once on ``one_gpu`` where the drafter views it."""
@@ -22,8 +24,6 @@ def weight_transform(model_dir, *, one_gpu: bool = False):
 
     def tiled(path: str) -> bool:
         """A lane format with bf16 scales and biases: what loading tiles."""
-
-        from .weights import LANE_FORMATS
 
         config, tensors = metadata()
         spec = resolve_affine(config, path)

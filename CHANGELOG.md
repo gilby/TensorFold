@@ -5,6 +5,11 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
+- **27B with DFlash2 on CUDA: CUDA graphs for one stream.** The tree verify, the commit and the draft step replay
+  graphs, with drafted replies unchanged. On two A40s behind a 2.1 GHz Xeon, the NVFP4 checkpoint decodes one stream
+  2.0x faster at `--tp 2` (100-136 tok/s) and 1.15x on one GPU, and a lone stream under `--parallel 4` gains the
+  same. At `--tp 2` rounds of several streams replay one graph as well. Two-rank replies now report their accepted
+  drafts.
 - **Qwen3.8-27B on Tesla V100 (sm_70).** The MLX 4-bit checkpoint and its DFlash2 drafter serve on Volta GPUs through
   their own kernels (`mma.m8n8k4` decode matmuls and tree attention, a dense-fp16 cuBLASLt prompt path), with the
   row-invariance contract kept, so drafted replies equal serial ones. One 32 GB V100 serves about 164,000 tokens with

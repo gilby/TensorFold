@@ -338,6 +338,8 @@ class VoltaExperts:
         part = sc["part"] if sk > 1 else sc["none"]
         need = sk * pairs * 2 * self.width
         if sk > 1 and part.numel() < need:
+            if torch.cuda.is_current_stream_capturing():
+                _RETIRED.append(part)
             part = sc["part"] = torch.empty((need,), dtype=torch.float32, device=x.device)
         _ext().experts884(2, x16, rs, self.up, self.up_s, self.up_a, sc["members"], sc["items"], sc["counts"], slots,
                           act, part[:need] if sk > 1 else part, cnt, self.width, sk, top, self.limit)
@@ -348,6 +350,9 @@ class VoltaExperts:
 
 
 _EXPERT_SCRATCH: dict = {}
+# Scratch a larger capture replaced (a capture stream has its own): kept, never freed. A graph captured with it still
+# writes there on every replay, so it must never go back to a graph pool where a later capture's outputs could land.
+_RETIRED: list = []
 
 
 def _expert_scratch(pairs: int, device) -> dict:
@@ -356,6 +361,8 @@ def _expert_scratch(pairs: int, device) -> dict:
     key = (str(device), torch.cuda.current_stream(device).cuda_stream)
     sc = _EXPERT_SCRATCH.get(key)
     if sc is None or sc["pairs"] < pairs:
+        if sc is not None and torch.cuda.is_current_stream_capturing():
+            _RETIRED.append(sc)
         cap = 1 << max(8, (pairs - 1).bit_length())
         sc = _EXPERT_SCRATCH[key] = {
             "pairs": cap, "members": torch.zeros(cap, dtype=torch.int32, device=device),

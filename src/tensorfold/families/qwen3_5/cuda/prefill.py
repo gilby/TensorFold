@@ -37,7 +37,7 @@ def _mm(x, w: QLinear, f32: bool = False) -> torch.Tensor:
 
         t = qmm_volta.Tiled.wrap(packed.weight, packed.scales, packed.biases, packed.rows)
         return qmm_volta.prompt_matmul(x, t, f32=f32)
-    if packed.fast:                                       # each weight rounded once to bf16, one fp32 chain over K
+    if packed.fast and packed.layout == "tiled":          # each weight rounded once to bf16, one fp32 chain over K
         return shared.prefill_matmul(x, packed, f32=f32, tile=shared.prompt_tile(x.shape[0], packed.n))
     return matmul_partial(x, packed) if f32 else matmul(x, packed)
 

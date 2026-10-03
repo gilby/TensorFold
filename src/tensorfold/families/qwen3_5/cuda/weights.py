@@ -10,10 +10,12 @@ from typing import Any
 
 import torch
 
+LANE_FORMATS = {(bits, gs) for bits in (4, 5, 6, 8) for gs in (32, 64)}    # (bits, group) the lane kernels read
+
 
 @dataclass
 class QLinear:
-    weight: torch.Tensor      # original MLX words, or the optimized four-bit tile layout
+    weight: torch.Tensor      # original MLX words, or the lane kernels' tile layout
     scales: torch.Tensor | None
     biases: torch.Tensor | None
     layout: str = "mlx"       # "mlx" as stored, "tiled" (``qmm_fast.tile``) or "volta" (``qmm_volta.Tiled`` words)
@@ -31,15 +33,23 @@ class QLinear:
             return int(self.weight.shape[1])
         if self.layout == "volta":
             return int(self.weight.shape[1]) * 64
-        return int(self.weight.shape[1]) * 64 if self.layout == "tiled" else int(self.scales.shape[1]) * self.gs
+        return int(self.weight.shape[1]) * self.gs if self.layout == "tiled" else int(self.scales.shape[1]) * self.gs
 
     def nbytes(self) -> int:
         return sum(t.numel() * t.element_size() for t in (self.weight, self.scales, self.biases) if t is not None)
 
     @cached_property
     def fast(self) -> bool:
-        return (self.bits, self.gs) == (4, 64) and self.layout != "dense" and all(
+        """Whether the lane kernels read this format (4, 5, 6 or 8 bits in groups of 32 or 64, bf16 scales)."""
+
+        return (self.bits, self.gs) in LANE_FORMATS and self.layout != "dense" and all(
             t.dtype == torch.bfloat16 for t in (self.scales, self.biases))
+
+    @cached_property
+    def nibble(self) -> bool:
+        """Whether this is 4-bit in groups of 64, the format the FP8 prompt, embedding and sm_70 kernels read."""
+
+        return self.fast and (self.bits, self.gs) == (4, 64)
 
 
 @dataclass
@@ -250,7 +260,7 @@ class Weights:
             if self.quant == "nvfp4":                # NVFP4 and FP8 have one; bf16 gates only with their e4m3 copies
                 if any(not hasattr(q, "prefill8") for q in modules):
                     return False
-            elif any(not q.fast for q in modules):
+            elif any(not q.nibble for q in modules):
                 return False
         return True
 
@@ -330,7 +340,7 @@ def load(model_dir: str | Path, device: str = "cuda", *, tiled: bool = False, ml
         if tiled and pack:
             from .qmm_fast import tile
 
-            return tile(q)                                 # tile() leaves any format but 4-bit g64 as stored
+            return tile(q)                                 # tile() leaves formats the lane kernels do not read as stored
         return q
 
     layers = []

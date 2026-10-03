@@ -19,7 +19,7 @@ Choose an 8-bit checkpoint made from the original model when you want its 8-bit 
 | --- | --- |
 | Qwen dense, M5 native lane kernels | Affine 2/3/4/5/6/8-bit, group 64; affine 4-bit also group 32 |
 | Qwen dense, packed row kernels on Apple Silicon | Affine 2/3/4/5/6/8-bit, groups 32/64/128 |
-| Qwen dense, CUDA | Affine 2/3/4/5/6/8-bit, groups 32/64/128 |
+| Qwen dense, CUDA | Affine 2/3/4/5/6/8-bit, groups 32/64/128; the lane kernels read 4/5/6/8-bit in groups of 32 or 64, the rest a general reader |
 | Nemotron | Existing affine 4-bit recipe; broader expert formats are not enabled here |
 | Flash Next | Existing uniform affine 4-bit/group-32 recipe |
 | GLM and EXL3 | Existing family recipes and separate EXL3 integration |

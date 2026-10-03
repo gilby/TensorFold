@@ -29,7 +29,7 @@ class Qwen27Engine:
                  tp_draft: bool = False, allow_copy: bool = True, streams: int = 1,
                  context: int | None = None, context_explicit: bool | None = None, vision: bool = False,
                  vision_urls: bool = False, vision_offload: bool = False, tree_rows: int | None = None,
-                 keep: int | None = None):
+                 keep: int | None = None, loader=None):
         import torch
 
         from tensorfold.cuda.nvfp4.format import is_quantized
@@ -112,15 +112,28 @@ class Qwen27Engine:
             full = load(model_dir)
             self.w = split_weights(full, rank, tiled=True, split_head=split_head)
         else:
-            full = load(model_dir, tiled=True)
+            full = loader(model_dir) if loader is not None else load(model_dir, tiled=True)
             self.w = full
         self.w.prompt_rows = chunk
         self.draft = None
         if draft_dir is not None and (rank == 0 or (tp == 2 and tp_draft)):
-            from .dflash2 import DFlash2
+            from .dflash1 import drafter_class
 
             # tp_draft: both ranks hold half the drafter and draft together (rank 1 needs --draft too)
-            self.draft = DFlash2(draft_dir, full, rank=rank, world=2) if tp == 2 and tp_draft else DFlash2(draft_dir, full)
+            kind = drafter_class(draft_dir)
+            self.draft = kind(draft_dir, full, rank=rank, world=2) if tp == 2 and tp_draft else kind(draft_dir, full)
+            if len(self.draft.taps) and max(self.draft.taps) >= full.config.layers:
+                raise ValueError(f"the drafter reads target layers {self.draft.taps}; this model has {full.config.layers}")
+            self.w.tap_layers = full.tap_layers = self.draft.taps
+        # one stream with a chain drafter (DSpark): the draft step and the target's chain verify replay CUDA graphs
+        self.chain = None
+        import os
+
+        if (self.draft is not None and hasattr(self.draft, "graph_chain") and tp == 1 and streams == 1
+                and os.environ.get("TF_DRAFT_GRAPHS", "1") != "0"):
+            from .chain_graphs import ChainGraphs
+
+            self.chain = ChainGraphs(self.w, self.context_window + 32)
         del full
         if vision and rank == 0:
             from tensorfold.vision.qwen_cuda import QwenCudaVision
@@ -153,6 +166,11 @@ class Qwen27Engine:
                                       context=self.capacity_plan["cache_slots"], keep=keep, points=self.points,
                                       vision=self.vision)
             self.multi.model_dir = self.model_dir             # rank 1 compiles a request's grammar from it
+            if (self.draft is not None and hasattr(self.draft, "graph_chain") and tp == 1
+                    and os.environ.get("TF_DRAFT_GRAPHS", "1") != "0"):
+                from .chain_graphs import ChainGraphs
+
+                self.multi.chain = ChainGraphs(self.w, self.context_window + 32)     # a lone stream's rounds
             self.multi.calibrate(streams)
             if rank == 0:
                 print(f"[tensorfold] {streams} streams of {self.context_window} prompt/reply tokens, {keep} prompt "
@@ -245,10 +263,17 @@ class Qwen27Engine:
         if on_tokens([pending]):
             return {"prefill_s": prefill_s, "cached": hit[1].pos if hit else 0}
         # the cache holds the state before the last prompt token, not ``st``: the decode may commit into it
-        result = draft_decode(self.w, st, prompt, pending, max_tokens, sampling, drafter,
-                              max_rows=self.max_rows, tree_rows=self.tree_rows,
-                              allow_copy=self.allow_copy and draft, stop_eos=stop_eos,
-                              on_tokens=on_tokens, inplace=True, **grammar)
+        chain = getattr(self, "chain", None)
+        if chain is not None and drafter is not None and constraint is None and vision is None:
+            from .chain_graphs import chain_decode
+
+            result = chain_decode(self.w, st, prompt, pending, max_tokens, sampling, drafter, chain,
+                                  allow_copy=self.allow_copy, stop_eos=stop_eos, on_tokens=on_tokens)
+        else:
+            result = draft_decode(self.w, st, prompt, pending, max_tokens, sampling, drafter,
+                                  max_rows=self.max_rows, tree_rows=self.tree_rows,
+                                  allow_copy=self.allow_copy and draft, stop_eos=stop_eos,
+                                  on_tokens=on_tokens, inplace=True, **grammar)
         return {"prefill_s": prefill_s, "decode_s": result.seconds, "rounds": result.rounds,
                 "cached": hit[1].pos if hit else 0, "drafts": draft, "min_rows": min(result.widths, default=0),
                 "drafted": result.drafted_rows, "accepted": result.accepted_drafts}

@@ -153,7 +153,9 @@ def layer_counts(t: dict) -> tuple[int, int]:
 def prompt_row_bytes(t: dict, world: int = 1) -> int:
     """Bytes one dense prompt row's arrays hold at once, drafter taps included (the 27B measured 306-315 KiB)."""
 
-    return 16 * (int(t["hidden_size"]) + int(t["intermediate_size"]) // world)
+    # a MoE row: its routed slots (top-k and the shared expert) of expert width, where a dense one has its MLP
+    inter = t.get("intermediate_size") or (int(t["num_experts_per_tok"]) + 1) * int(t["moe_intermediate_size"])
+    return 16 * (int(t["hidden_size"]) + int(inter) // world)
 
 
 def prompt_rows(total: int, row_bytes: int, most: int = 4096) -> int:
@@ -317,6 +319,8 @@ def draft_ring_rows(window: int, block: int, tile: int = 64) -> int:
 
 def draft_geometry(t: dict, world: int, reserve: int, *, bounded: bool = False, streams: int = 1,
                    kept: int = 0) -> Geometry:
+    if "transformer_layer_config" in t:      # a speculators drafter (DSpark): its layers' fields nest one level down
+        t = {**t["transformer_layer_config"], **{k: v for k, v in t.items() if k != "transformer_layer_config"}}
     layers = int(t["num_hidden_layers"])
     heads = int(t["num_key_value_heads"]) // world
     hd = int(t["head_dim"])

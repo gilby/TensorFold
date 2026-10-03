@@ -120,3 +120,33 @@ def test_f32_and_strided_rows():
     a = lin.matmul(big[:, :1024], f32=True)
     b = lin.matmul(big[:, :1024].contiguous(), f32=True)
     assert a.dtype == torch.float32 and torch.equal(a, b)
+
+
+def test_per_channel_fp8_is_the_stored_values_and_shards():
+    """FP8 with one scale an output channel (unsloth's compressed-tensors 27B): the column factors carry the scales,
+    so the values are the checkpoint's exactly, rows never depend on the row count, and two-rank shards are the
+    projections built from the sliced checkpoint."""
+
+    n, k = 1000, 5120
+    g = _gen(21)
+    w = torch.randint(0, 256, (n, k), generator=g, device="cuda", dtype=torch.int32).to(torch.uint8)
+    w[(w & 0x7F) == 0x7F] = 0x11                                        # no NaN codes
+    s = torch.ldexp(torch.ones(n, device="cuda"), torch.randint(-12, -4, (n,), generator=g, device="cuda"))
+    s = s * (1 + torch.rand(n, generator=g, device="cuda"))
+    w8 = w.view(torch.float8_e4m3fn)
+    lin = VoltaLinear.from_fp8(w8, s)
+    ref = w8.float() * s[:, None]
+    assert torch.equal((lin.dense().double() * lin.alpha[:n, None].double()).float(), ref)
+    x = torch.randn((40, k), generator=_gen(8), device="cuda").to(torch.bfloat16)
+    alone = torch.cat([lin(x[r:r + 1]) for r in range(40)])
+    assert torch.equal(lin(x), alone)
+    want = x.float() @ ref.T
+    for y in (lin.matmul(x, f32=True), lin.prefill(x, f32=True)):
+        for r in range(40):
+            assert (y[r] - want[r]).abs().max().item() <= want[r].abs().max().item() * 2 ** -12
+    rows = torch.arange(n // 2, n, device="cuda")
+    assert torch.equal(lin.outputs(rows)(x), VoltaLinear.from_fp8(w8[n // 2:], s[n // 2:])(x))
+    assert torch.equal(lin.inputs(1).partial(x[:, k // 2:]),
+                       VoltaLinear.from_fp8(w8[:, k // 2:], s).partial(x[:, k // 2:]))
+    with pytest.raises(ValueError):
+        VoltaLinear.from_fp8(w8, s[:7])

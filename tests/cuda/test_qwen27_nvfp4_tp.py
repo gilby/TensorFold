@@ -15,7 +15,7 @@ import torch
 if not torch.cuda.is_available():
     pytest.skip("CUDA only", allow_module_level=True)
 
-from tensorfold.cuda.nvfp4.linear import Fp4Linear, Fp8Linear
+from tensorfold.cuda.nvfp4.linear import Fp4Linear, Fp8BlockLinear, Fp8Linear
 from tensorfold.families.qwen3_5.cuda import distributed
 from tensorfold.families.qwen3_5.cuda.distributed import output_rows, split_input, split_output, split_weights
 from tensorfold.families.qwen3_5.cuda.forward import State, commit, tree_forward
@@ -86,6 +86,27 @@ def test_fp8_and_bf16_shards_are_the_sliced_checkpoint():
     assert torch.equal(split_output(tiny, 1).weight, tiny.weight[24:])
 
 
+def _per_channel(w8: torch.Tensor, s: torch.Tensor) -> Fp8BlockLinear:
+    n, k = w8.shape
+    return Fp8BlockLinear.from_rows(w8, s.view(n, 1).expand(n, k // 64).contiguous())
+
+
+def test_per_channel_fp8_shards_and_tiles_are_the_sliced_checkpoint():
+    """FP8 with a scale per output channel: column and row shards and head tiles equal ones built from the slices."""
+
+    gen = torch.Generator().manual_seed(8)
+    w8 = _raw8(768, 256, gen)
+    s = (torch.rand(768, generator=gen) * 0.01 + 0.001).cuda()
+    full = _per_channel(w8, s)
+    for rank in (0, 1):
+        rows = output_rows(768, rank, segments=(256, 256, 256), device="cuda")
+        _same(split_output(full, rank, segments=(256, 256, 256)), _per_channel(w8[rows], s[rows]))
+        _same(split_input(full, rank), _per_channel(w8[:, rank * 128:(rank + 1) * 128], s))
+    _same(full.tiles(2, 6), _per_channel(w8[128:384], s[128:384]))
+    x = (torch.randn(5, 256, generator=gen) * 0.5).to(torch.bfloat16).cuda()
+    assert torch.equal(full.tiles(2, 6)(x), full(x)[:, 128:384])
+
+
 def test_shards_refuse_partial_tiles():
     gen = torch.Generator().manual_seed(5)
     full = Fp4Linear.from_checkpoint(*_raw4(192, 128, gen), 0.05)
@@ -95,7 +116,7 @@ def test_shards_refuse_partial_tiles():
         split_input(Fp8Linear.from_checkpoint(_raw8(128, 64, gen), 0.01), 0)
 
 
-@pytest.mark.parametrize("kind", ["fp4", "fp8"])
+@pytest.mark.parametrize("kind", ["fp4", "fp8", "fp8-channel"])
 @pytest.mark.parametrize("n,k", [(128, 256), (5120, 8704 * 2)])
 def test_row_partials_are_fp32_row_invariant_and_sum_to_the_product(kind, n, k):
     """A rank's fp32 partial rounds to its own bf16 output, never depends on the rows beside it, and the rank sum is the product."""
@@ -107,10 +128,15 @@ def test_row_partials_are_fp32_row_invariant_and_sum_to_the_product(kind, n, k):
         codes = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6], device="cuda")
         dense = torch.stack([codes[(packed & 15).long()], codes[(packed >> 4).long()]], -1).view(n, k)
         dense = dense * scale.view(torch.float8_e4m3fn).float().repeat_interleave(16, 1) * 0.01
-    else:
+    elif kind == "fp8":
         w8 = _raw8(n, k, gen)
         full = Fp8Linear.from_checkpoint(w8, 0.004)
         dense = w8.float() * 0.004
+    else:
+        w8 = _raw8(n, k, gen)
+        s = (torch.rand(n, generator=gen) * 0.004 + 0.001).cuda()
+        full = _per_channel(w8, s)
+        dense = w8.float() * s[:, None]
     x = (torch.randn(64, k, generator=gen) * 0.5).to(torch.bfloat16).cuda()
     shards = [split_input(full, r) for r in (0, 1)]
     xs = [x[:, r * k // 2:(r + 1) * k // 2] for r in (0, 1)]

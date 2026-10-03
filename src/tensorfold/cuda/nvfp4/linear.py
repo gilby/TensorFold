@@ -491,6 +491,37 @@ class Fp8BlockLinear:
     def nbytes(self) -> int:
         return self.w8.numel() + self.bs.numel() + (self.groups.numel() * 2 if self.groups is not None else 0)
 
+    def tiles(self, t0: int, t1: int) -> "Fp8BlockLinear":
+        """Outputs [64 t0, 64 t1) as views, no copy (decode only)."""
+
+        per = 64 * self.k
+        return Fp8BlockLinear(self.w8[t0 * per:t1 * per], self.bs[t0:t1], min(self.n, 64 * t1) - 64 * t0, self.k,
+                              64 * (t1 - t0), lane=self.lane)
+
+    def _blocks(self) -> torch.Tensor:
+        return self.w8.view(self.npad // 64, self.k // 64, 4096)
+
+    def outputs(self, rows: torch.Tensor) -> "Fp8BlockLinear":
+        """Column-parallel shard: the stored fragment tiles of ``rows`` (whole 64-output tiles) and their scales."""
+
+        t = _tiles_of(rows, self.n, "FP8")
+        npad = 64 * (t.numel() + t.numel() % 2)
+        return Fp8BlockLinear(_even(self._blocks().index_select(0, t), t.numel()).view(-1),
+                              _even(self.bs.index_select(0, t), t.numel()), int(rows.numel()), self.k, npad,
+                              lane=self.lane)
+
+    def inputs(self, rank: int, world: int = 2) -> "Fp8BlockLinear":
+        """Row-parallel shard: whole 64-input groups of every fragment tile, with those groups' scales."""
+
+        g0, g1 = _input_groups(self.k, rank, world, "FP8")
+        return Fp8BlockLinear(self._blocks()[:, g0:g1].contiguous().view(-1), self.bs[:, g0:g1].contiguous(), self.n,
+                              64 * (g1 - g0), self.npad, lane=self.lane)
+
+    def partial(self, x: torch.Tensor) -> torch.Tensor:
+        """A row-parallel rank's fp32 (M, n) product, unrounded, for the rank-ordered sum."""
+
+        return _matmul(FP8G, self.w8, self.bs, 1.0, self.n, self.k, self.npad, x, None, f32=True)
+
     def __call__(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
         return _matmul(FP8G, self.w8, self.bs, 1.0, self.n, self.k, self.npad, x, out)
 

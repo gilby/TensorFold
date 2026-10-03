@@ -99,14 +99,22 @@ class VoltaLinear:
         return cls(FP4, words, scales.contiguous(), _alpha(float(global_scale) * 16384.0, n, weight.device), n, k)
 
     @classmethod
-    def from_fp8(cls, weight: torch.Tensor, scale: float) -> "VoltaLinear":
-        """``weight`` e4m3 [N, K] with one tensor scale."""
+    def from_fp8(cls, weight: torch.Tensor, scale: "float | torch.Tensor") -> "VoltaLinear":
+        """``weight`` e4m3 [N, K] with one tensor scale, or one fp32 scale an output channel (``scale`` [N]): either
+        way it is the column factor, applied last."""
 
         n, k = weight.shape
         if k % 64:
             raise ValueError(f"FP8 weight [{n}, {k}]: K must be a multiple of 64")
+        if torch.is_tensor(scale):
+            scale = scale.to(weight.device, torch.float32).reshape(-1)
+            if scale.numel() != n:
+                raise ValueError(f"FP8 weight [{n}, {k}]: {scale.numel()} scales, not one or one an output")
+            scale = scale * 256.0
+        else:
+            scale = float(scale) * 256.0
         words = _tile(weight.contiguous().view(torch.uint8).view(torch.int32), 16)
-        return cls(FP8, words, None, _alpha(float(scale) * 256.0, n, weight.device), n, k)
+        return cls(FP8, words, None, _alpha(scale, n, weight.device), n, k)
 
     @classmethod
     def from_bf16(cls, weight: torch.Tensor, chunk: int = 8192) -> "VoltaLinear":

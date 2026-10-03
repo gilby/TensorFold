@@ -10,7 +10,8 @@ import math
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8,
+                                reason="EXL3 kernels need CUDA sm_80 or newer")
 
 
 def _trellis(k, n, k2, gen):

@@ -45,14 +45,26 @@ def vision_workspace() -> int:
     return int(value) * 2**20
 
 
-def build_kernels(*, exl3: bool = False, nvfp4: bool = False, solo: bool = True) -> None:
+def build_kernels(*, exl3: bool = False, nvfp4: bool = False, solo: bool = True, sm70: bool = False) -> None:
     """Load each applicable extension after admission and before resident weights consume the pool."""
 
-    from tensorfold.cuda import experts
     from tensorfold.cuda.kernels import gdn as shared_gdn
-    from tensorfold.cuda.kernels import qmm
 
     from . import gdn, gdn_io
+
+    if sm70:                                     # an NVFP4 checkpoint on sm_70: its own linears, experts and attention
+        from tensorfold.cuda.kernels import qmmf_volta
+
+        from . import attention
+
+        loaders = [shared_gdn._ext, gdn_io._ext, qmmf_volta._ext, attention._volta_ext]
+        if solo:
+            loaders.append(gdn._ext)
+        for load in loaders:
+            load()
+        return
+    from tensorfold.cuda import experts
+    from tensorfold.cuda.kernels import qmm
 
     loaders = [experts._ext, shared_gdn._ext, qmm._ext, gdn_io._ext]
     if solo:                                     # serial windows, including a concurrent decoder's lone graph slot
@@ -173,7 +185,7 @@ class FlashNextEngine:
         if tp > 1:
             self._same_settings(torch, ids, vision)
         build_kernels(exl3=exl3, nvfp4=not exl3 and quant_method(read_config(model_dir)) == "modelopt",
-                      solo=streams == 1 or (graphs and mtp))
+                      solo=streams == 1 or (graphs and mtp), sm70=sm70)
         from concurrent.futures import wait
 
         from tensorfold.cuda.direct_read import wait_all
@@ -224,9 +236,9 @@ class FlashNextEngine:
         # ``streams`` > 1: up to that many requests decoded together, every stream's chain in one forward
         self.concurrent = streams > 1
         self.refuses_structured_output = (
-            "structured output is not served by Flash Next on two ranks with --parallel yet: "
+            "structured output is not served by Flash Next on several ranks with --parallel yet: "
             "send text without response_format or guided output, or start without --parallel"
-            if self.concurrent and tp == 2 else None)
+            if self.concurrent and tp > 1 else None)
         self.multi = self.scheduler = None
         if self.concurrent:
             from tensorfold.cuda.scheduler import Scheduler
@@ -286,10 +298,10 @@ class FlashNextEngine:
                 if hasattr(table, "lock_runs"):
                     pinned += table.lock_runs(max(0, room - pinned))
             reread_s = time.perf_counter() - started
-        if self.concurrent and tp == 2 and rank == 0:
+        if self.concurrent and tp > 1 and rank == 0:
             from .multi import Link
 
-            self.multi.link = Link(self.comm.store, rank=0, host=master)
+            self.multi.link = Link(self.comm.store, rank=0, host=master, world=tp)
         self.eos = tuple(w.cfg.eos)
         self.model_dir = Path(model_dir)
         self.served = 0
@@ -613,7 +625,7 @@ class FlashNextEngine:
         if self.multi is not None:
             from .multi import Link
 
-            self.multi.follow(Link(self.comm.store, rank=1, host=self.master))
+            self.multi.follow(Link(self.comm.store, rank=self.rank, host=self.master, world=self.tp))
             return
         while True:
             request = self._receive()

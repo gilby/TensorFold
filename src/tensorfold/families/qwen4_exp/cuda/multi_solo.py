@@ -83,7 +83,9 @@ class Alone:
 
         target, old = self.solo.st, s.st
         self._flush(s)
-        if any(k[1] is target for k in self.kept) and not self._relocate_kept(target, old):
+        # no spare for the graph slot's keeps: the oldest other keep makes one (re-pointing the slot recaptures)
+        if any(k[1] is target for k in self.kept) and not self._relocate_kept(target, old) and not (
+                self._evict_kept(target, protect=old) and self._relocate_kept(target, old)):
             self.solo.st = old                   # preserve both prefix chains instead of evicting a kept slot
             if self.planning:
                 self.actions.append(["solo", self._index(old)])

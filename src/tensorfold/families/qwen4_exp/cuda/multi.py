@@ -1,4 +1,4 @@
-"""Flash Next's shared rounds on one GPU or two ranks, with exact prompt pieces and growing caches."""
+"""Flash Next's shared rounds on one GPU or several ranks, with exact prompt pieces and growing caches."""
 
 from __future__ import annotations
 
@@ -254,7 +254,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         if any(x.waiting for x in self.streams.values()):
             raise NoRoom("streams already wait for memory; a new request waits until one finishes")
         if self.w.comm is not None and any(x is not None for x in (s.constraint, s.probabilities)):
-            raise ValueError("concurrent Flash Next on two ranks serves text without grammars or logprobs")
+            raise ValueError("concurrent Flash Next on several ranks serves text without grammars or logprobs")
         t0 = time.perf_counter()
         if self.w.comm is not None:
             if s.vision is not None and self.link is not None and not hasattr(s.vision, "features"):
@@ -361,7 +361,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                 pieces = []
         held = [self.held.pop(s.sid, []) for s in live]
         tables = self.buf.gdn_tables = gdn_multi.Tables(self.w, self.gdn, segs, held)
-        self.buf.attn_step = attn_multi.Step(self.w, segs, mtp=False)
+        self.buf.attn_step = attn_multi.step(self.w, segs, mtp=False)
         try:
             if pieces:                                 # the window and the pass: each layer's experts once for both
                 pends = self._end_rows(pieces, psegs)
@@ -479,7 +479,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
     def _mtp(self, segs: list) -> torch.Tensor:
         """An MTP step over every drafting stream, its attention one launch a kernel for all of them."""
 
-        self.mbuf.attn_step = attn_multi.Step(self.w, segs, mtp=True)
+        self.mbuf.attn_step = attn_multi.step(self.w, segs, mtp=True)
         try:
             return mtp_compute(self.w, segs, self.mbuf)
         finally:
@@ -514,7 +514,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         return out
 
     def _picks_tp(self, logits: torch.Tensor, positions: list[int], samplings: list) -> list[tuple[int, float]]:
-        """Two ranks: each row's keyed draft and probability from the draft head's gathered candidates."""
+        """Several ranks: each row's keyed draft and probability from the draft head's gathered candidates."""
 
         w, n = self.w, len(positions)
         if all(_gathered_fits(s) for s in samplings):

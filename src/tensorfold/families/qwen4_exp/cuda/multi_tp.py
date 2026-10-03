@@ -1,4 +1,4 @@
-"""Ordered two-rank admissions and round plans, checked before their GPU collectives."""
+"""Ordered admissions and round plans on two or more ranks, checked before their GPU collectives."""
 
 from __future__ import annotations
 
@@ -13,18 +13,20 @@ from tensorfold.cuda.memory_gate import NoRoom
 from tensorfold.cuda.streams import Stream
 
 class Link:
-    """Rank 0's ordered steps over TCP or the rendezvous store; rank 1 waits outside GPU collectives."""
+    """Rank 0's ordered steps to every other rank over TCP or the rendezvous store; followers wait outside collectives."""
 
     KEY = "tensorfold/flashnext/multi/socket"
 
-    def __init__(self, store, *, rank: int | None = None, host: str | None = None) -> None:
+    def __init__(self, store, *, rank: int | None = None, host: str | None = None, world: int = 2) -> None:
         import socket
 
-        self.store, self.n, self.sock, self.server = store, 0, None, None
+        self.store, self.n, self.world = store, 0, int(world)
+        self.rank = 1 if rank is None else int(rank)    # a follower's own messages (rank 0 sends; ``None``: rank 1)
+        self.sock, self.socks, self.server = None, [], None
         if host is None:
             return
         if rank == 0:
-            self.server = socket.create_server((host, 0))
+            self.server = socket.create_server((host, 0), backlog=max(1, self.world - 1))
             store.set(self.KEY, str(self.server.getsockname()[1]))
         else:
             store.wait([self.KEY], timedelta(hours=24))
@@ -37,20 +39,27 @@ class Link:
 
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-    def _key(self) -> str:
-        return f"tensorfold/flashnext/multi/{self.n}"
+    def _key(self, rank: int) -> str:
+        return f"tensorfold/flashnext/multi/{rank}/{self.n}"
 
     def send(self, op: list) -> None:
+        """The same message to every follower, in order."""
+
         if self.server is not None:
             import struct
 
-            if self.sock is None:                       # rank 1 connected at startup: this returns at once
-                self.sock, _ = self.server.accept()
-                self._fast(self.sock)
+            while len(self.socks) < self.world - 1:     # the followers connected at startup: this returns at once
+                sock, _ = self.server.accept()
+                self._fast(sock)
+                self.socks.append(sock)
             data = json.dumps(op).encode()
-            self.sock.sendall(struct.pack("!I", len(data)) + data)
+            frame = struct.pack("!I", len(data)) + data
+            for sock in self.socks:
+                sock.sendall(frame)
             return
-        self.store.set(self._key(), json.dumps(op))
+        text = json.dumps(op)
+        for r in range(1, self.world):
+            self.store.set(self._key(r), text)
         self.n += 1
 
     def _read(self, n: int) -> bytes | None:
@@ -71,7 +80,7 @@ class Link:
             return None if body is None else json.loads(body)
         from torch.distributed import DistNetworkError
 
-        key = self._key()
+        key = self._key(self.rank)
         while True:
             try:
                 self.store.wait([key], timedelta(hours=1))
@@ -131,12 +140,14 @@ class TwoRanks:
         if self.w.comm is None:
             return tuple(bool(value) for value in checks)
         digest = int.from_bytes(hashlib.sha256(json.dumps(plan).encode()).digest()[:8], "big", signed=True)
-        width = 1 + len(checks)
-        ranks = gather_ints(torch, self.w.comm.all_gather, [digest, *map(int, checks)])
-        if len(ranks) != 2 or any(len(rank) != width for rank in ranks):
+        width, world = 1 + len(checks), int(getattr(self.w.comm, "world", 2))
+        ranks = gather_ints(torch, self.w.comm.all_gather, [digest, *map(int, checks)], world)
+        if len(ranks) != world or any(len(rank) != width for rank in ranks):
             raise OutOfStep("the shared plan check returned an invalid rank count")
-        if ranks[0][0] != ranks[1][0]:
-            raise OutOfStep(f"the two ranks planned different {what}s; the requests in it fail, serving goes on")
+        odd = next((r for r in range(1, world) if ranks[r][0] != ranks[0][0]), None)
+        if odd is not None:
+            raise OutOfStep(f"rank {odd} planned a different {what} from rank 0; the requests in it fail, serving goes on")
+        # every check holds on every rank: a cache growth fits only when it fits the fullest rank
         return tuple(all(bool(rank[index]) for rank in ranks) for index in range(1, width))
 
     def _joined_ranks(self) -> None:
@@ -181,12 +192,12 @@ class TwoRanks:
                                                bool(s.draft), bool(s.stop_eos), bool(s.background), images],
                                   (valid, ready(self, plan)))
         if not valid:
-            raise OutOfStep("the agreed prefix is not available on both ranks")
+            raise OutOfStep("the agreed prefix is not available on every rank")
         if not fits:
             if not self.streams and not self.filling:
                 raise ValueError("the prompt cannot fit available memory; shorten it or lower the server context")
-            raise NoRoom("the proposed prompt cache growth does not fit on both ranks")
-        if images is not None:                       # both ranks reach this point or neither does
+            raise NoRoom("the proposed prompt cache growth does not fit on every rank")
+        if images is not None:                       # every rank reaches this point or none does
             s.vision = self._share_vision(s, images)
         apply(self, plan)
         if plan["error"]:
@@ -214,7 +225,7 @@ class TwoRanks:
             self.link.send(["round", [s.sid for s in [*self.streams.values(), *self.filling] if s.done], plan])
         (fits,) = self._agree("round", [shape(self), plan], (ready(self, plan),))
         if not fits:
-            raise NoRoom("the proposed round cache growth does not fit on both ranks")
+            raise NoRoom("the proposed round cache growth does not fit on every rank")
         ended = [self.streams[sid] for sid in plan["ended"]]
         apply(self, plan)
         self.pass_plan, self.mixed_plan = plan["passes"], plan["mixed"]
@@ -239,7 +250,7 @@ class TwoRanks:
                 try:
                     self.admit(s, told=plan)
                 except (ValueError, NoRoom, OutOfStep) as exc:
-                    print(f"[tensorfold] rank 1: stream {sid} refused: {exc}", flush=True)
+                    print(f"[tensorfold] rank {link.rank}: stream {sid} refused: {exc}", flush=True)
             elif op[0] == "round":
                 for s in [*self.streams.values(), *self.filling]:
                     if s.sid in op[1]:
@@ -247,7 +258,7 @@ class TwoRanks:
                 try:
                     finished.update({s.sid: s for s in self.round(told=op[2])})
                 except Exception as exc:                 # rank 0 drops the same failed round
-                    print(f"[tensorfold] rank 1: a round failed: {exc}", flush=True)
+                    print(f"[tensorfold] rank {link.rank}: a round failed: {exc}", flush=True)
             elif op[0] == "finish":
                 known = {**self.streams, **finished}
                 self.finish([known[sid] for sid in op[1] if sid in known])

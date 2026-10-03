@@ -120,6 +120,18 @@ class Step:
             self.vision_ptrs = shared.to_device(np.asarray(vp, dtype=np.int64).T.ravel().tolist(), torch.int64, dev)
 
 
+def step(w, segs: Sequence, mtp: bool) -> Step | None:
+    """A step's tables, or None where each stream takes the one-stream attention: sm_70's bf16 caches (its CUDA kernel's
+    partials, which Triton's would not equal)."""
+
+    st = segs[0][0]
+    cache = st.mtp_kc if mtp else st.kc[0]
+    index = w.device.index if getattr(w.device, "index", None) is not None else torch.cuda.current_device()
+    if not cache.quantized and attn_mod._on_volta(index):
+        return None
+    return Step(w, segs, mtp)
+
+
 def layer(layer, w, b, step: Step, mtp: bool, scale: float) -> torch.Tensor:
     """Every stream's ``layer`` attention: prep, pool, sparse streams' own selects, chunks, merge -> b.attn_o[:R]."""
 

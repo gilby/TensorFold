@@ -288,6 +288,9 @@ def _rows_forward(core: Any, windows: Sequence[Any], parents: Sequence[Sequence[
                   ) -> tuple[mx.array, _Rows]:
     """Return final-normed rows [1, R, D] and stream records, sharing row-wise work while keeping attention and recurrent caches per stream."""
 
+    own = getattr(core, "_tensorfold_rows_forward", None)
+    if own is not None:                       # a core whose matmuls are not the backend's (EXL3) walks its own way
+        return own(core, windows, parents, caches, starts, pipeline_layers=pipeline_layers, first_alone=first_alone)
     widths = [len(p) for p in parents]
     if len(windows) != len(parents) or len(caches) != len(parents) or len(starts) != len(parents):
         raise ValueError(f"row_forward: {len(windows)} windows, {len(parents)} parent lists, {len(caches)} caches, "

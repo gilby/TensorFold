@@ -49,8 +49,11 @@ class Qwen36Family(Qwen35Family):
             from tensorfold.families.qwen4_exp.draft_head import cut_head, draft_ids
 
             ids = draft_ids()
-            if int(ids.max()) < int(self.lm_head["weight"].shape[0]):    # the Qwen 3.5-3.8 tokenizer's ids
-                self._draft_ids, self._draft_head = mx.array(ids), cut_head(self.lm_head, ids)
+            own = getattr(self.lm_head, "draft_head", None)              # an EXL3 head: its draft rows decoded
+            vocab = int(self.lm_head.outputs) if own is not None else int(self.lm_head["weight"].shape[0])
+            if int(ids.max()) < vocab:                                    # the Qwen 3.5-3.8 tokenizer's ids
+                self._draft_ids = mx.array(ids)
+                self._draft_head = own(ids) if own is not None else cut_head(self.lm_head, ids)
         self.mtp_step_ms = self._time_mtp_step()
         vocab = "every token" if self._draft_ids is None else f"{int(self._draft_ids.shape[0]):,} draft ids"
         print(f"[tensorfold] MTP drafts from {Path(mtp_path).name}: up to {self.drafts} a round over {vocab}, a "

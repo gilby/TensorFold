@@ -12,6 +12,9 @@ import mlx.nn as nn
 from mlx_lm.models.cache import KVCache
 
 MTP_FILE = "mtp-4bit.safetensors"      # beside the checkpoint (TensorFold/Qwen3.6-35B-A3B-MLX-4bit-MTP ships it)
+MTP_BF16_FILE = "mtp.safetensors"      # the base model's bf16 layer in HF names, beside an EXL3 pack (which drops it)
+HF_NORMS = ("pre_fc_norm_embedding.weight", "pre_fc_norm_hidden.weight", "input_layernorm.weight",
+            "post_attention_layernorm.weight", "q_norm.weight", "k_norm.weight", "norm.weight")
 INDEX = "model.safetensors.index.json"  # or in the checkpoint's own shards, as oQ quants with preserve_mtp keep it
 
 
@@ -129,11 +132,35 @@ def load(path: Path, args: Any) -> Qwen36MTP:
 
     raw = _stored(Path(path))
     weights = {name.split("mtp.", 1)[1] if "mtp." in name else name: value for name, value in raw.items()}
+    hf = any(name.endswith("mlp.experts.gate_up_proj") for name in weights)
+    if hf:
+        weights = _from_hf(weights)
     mtp = Qwen36MTP(args)
     nn.quantize(mtp, class_predicate=lambda p, m: hasattr(m, "to_quantized") and _formats(weights, m, p))
     mtp.load_weights(list(weights.items()), strict=True)
+    if hf:                                   # drafts only: the stored model's own MTP format (4-bit, routers 8-bit)
+        nn.quantize(mtp, group_size=64, bits=4, class_predicate=lambda p, m: hasattr(m, "to_quantized") and (
+            {"group_size": 64, "bits": 8} if p.endswith("mlp.gate") or p.endswith("shared_expert_gate") else True))
     mx.eval(mtp.parameters())
     return mtp
+
+
+def _from_hf(weights: dict[str, mx.array]) -> dict[str, mx.array]:
+    """HF names to the mlx layer's: experts split into gate / up / down, norms stored as gamma - 1 recentred."""
+
+    out = {}
+    for name, value in weights.items():
+        if name.endswith("mlp.experts.gate_up_proj"):
+            base, mid = name[:-len("experts.gate_up_proj")], int(value.shape[-2]) // 2
+            out[base + "switch_mlp.gate_proj.weight"] = value[..., :mid, :]
+            out[base + "switch_mlp.up_proj.weight"] = value[..., mid:, :]
+        elif name.endswith("mlp.experts.down_proj"):
+            out[name[:-len("experts.down_proj")] + "switch_mlp.down_proj.weight"] = value
+        elif any(name.endswith(norm) for norm in HF_NORMS) and value.ndim == 1:
+            out[name] = (value.astype(mx.float32) + 1.0).astype(value.dtype)
+        else:
+            out[name] = value
+    return out
 
 
 def find(model_dir: Path, choice: str = "") -> Path | None:
@@ -146,13 +173,14 @@ def find(model_dir: Path, choice: str = "") -> Path | None:
         if not named.is_file():
             raise FileNotFoundError(f"the MTP file {named} does not exist")
         return named
-    found = Path(model_dir) / MTP_FILE
-    if found.is_file():
-        return found
+    for name in (MTP_FILE, MTP_BF16_FILE):
+        found = Path(model_dir) / name
+        if found.is_file():
+            return found
     index = Path(model_dir) / INDEX
     if index.is_file() and any(_is_mtp(name) for name in json.loads(index.read_text()).get("weight_map", {})):
         return index
     return None
 
 
-__all__ = ["MTPCache", "MTP_FILE", "Qwen36MTP", "absorb_attention", "chain_attention", "find", "load"]
+__all__ = ["MTPCache", "MTP_BF16_FILE", "MTP_FILE", "Qwen36MTP", "absorb_attention", "chain_attention", "find", "load"]

@@ -78,6 +78,12 @@ def install_row_decoder(model: Any) -> bool:
     from tensorfold.kernels.qwen.dense.v1 import exact_attention, row_forward, row_matmul
 
     backend = row_matmul.simd_qmm_backend()
+    if getattr(model, "_tensorfold_exl3", False):          # EXL3 layers: their own row kernels (kernels.exl3)
+        exact_attention.install()
+        exact_attention.EXACT_MAX_QUERIES = max(exact_attention.EXACT_MAX_QUERIES, row_forward.PROMPT_ROWS)
+        row_matmul.BACKEND = backend
+        model._tensorfold_row_decoder = True
+        return True
     if not row_matmul.fits(model, backend):
         return False
     exact_attention.install()

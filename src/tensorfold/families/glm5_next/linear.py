@@ -131,10 +131,123 @@ def _rows(q: Q | QSplit, lo: int, hi: int) -> Q:
     return Q(q.weight[lo:hi], q.scales[lo:hi], q.biases[lo:hi], bits=q.bits, group=q.group)
 
 
+_MATRIX: dict[int, tuple] = {}            # id(Q) -> (weight, prepared arrays, or None: the row kernels)
+_BACKEND: list = []
+
+
+def _tensor_units() -> bool:
+    from tensorfold.families.qwen3_5 import tensor_units
+
+    return bool(tensor_units())
+
+
+def choose(bits: int, group: int, n: int, k: int, *, lane: bool) -> bool:
+    """Whether a decode linear takes the matrix kernel (lane_qmm if ``lane``, else simd_qmm), by format and shape."""
+
+    if n % 8 or k % group:
+        return False
+    if bits in (4, 8) and group == 64 and k in (64, 128):     # qmv_quad_rows shares reads across a window
+        return False
+    if bits in (5, 6, 8):                     # the row kernels loop or re-read from two rows; one row is close
+        return group == 64 or (group == 128 and not lane)
+    return bits == 4 and group == 128 and not lane           # 4-bit groups of 64 keep qmv_rows: faster to 4 rows
+
+
+def _backend() -> Any:
+    if not _BACKEND:
+        if _tensor_units():
+            _BACKEND.append("lane")
+        else:
+            from tensorfold.kernels.qwen.dense.v1 import row_matmul
+
+            _BACKEND.append(row_matmul.simd_qmm_backend())
+    return _BACKEND[0]
+
+
+def _prepare(q: "Q") -> tuple:
+    """The matrix kernel's arrays for q, or (weight, None) when q keeps the row kernels; decided once per linear."""
+
+    backend = _backend()
+    lane = backend == "lane"
+    if not choose(q.bits, q.group, q.outs, q.ins, lane=lane) or q.weight.ndim != 2:
+        return (q.weight, None)
+    if lane:
+        from tensorfold.kernels.qwen.dense.v1 import lane_qmm
+
+        scales, biases, group = q.scales, q.biases, q.group
+        if group == 128:                  # lane_qmm reads groups of 32 or 64: one scale read as two groups of 64
+            scales, biases, group = mx.repeat(scales, 2, axis=1), mx.repeat(biases, 2, axis=1), 64
+        probe = mx.zeros((1, q.ins), dtype=mx.bfloat16)
+        if not lane_qmm.supports(q.weight, scales, probe, q.bits, group, "affine"):
+            return (q.weight, None)
+        n = q.outs
+        nt = 64 if (q.bits == 4 and n % 64 == 0) else 32 if n % 32 == 0 else 0
+        tiled = lane_qmm.tile_weight(q.weight, nt, group, bits=q.bits) if nt else q.weight
+        sbt = lane_qmm.pack_scales(scales, biases)
+        mx.eval(tiled, sbt)
+        return (q.weight, "lane", tiled, sbt, nt, group)
+    from tensorfold.kernels.qwen.dense.v1 import simd_qmm_bits
+
+    w, s, b = q.weight, q.scales, q.biases
+    if q.bits == 4 and q.group == 128 and simd_qmm_bits.reads(w, s, b, 128, 4):
+        # 4-bit groups of 128 read natively (one scale load a group), its one-row twin checked once like 5-8 bits
+        if simd_qmm_bits.check(w, s, b, 4, 128):
+            return (q.weight, "g128", s, b, 128)
+        s, b = mx.repeat(s, 2, axis=1), mx.repeat(b, 2, axis=1)
+        mx.eval(s, b)
+        backend.prepare([(w, s, b, 64, 4)])
+        return (q.weight, "backend", s, b, 64)
+    backend.prepare([(w, s, b, q.group, q.bits)])     # 5/6/8-bit groups of 128 are read natively by simd_qmm_bits
+    return (q.weight, "backend", s, b, q.group)
+
+
+def on_matrix(q: Any) -> bool:
+    """Whether a decode linear (for a split one, any part) runs on the matrix kernel on this Metal device."""
+
+    if isinstance(q, QSplit):
+        return any(on_matrix(p) for p in q.parts)
+    if not isinstance(q, Q) or not K.metal():
+        return False
+    hit = _MATRIX.get(id(q))
+    if hit is None or hit[0] is not q.weight:
+        hit = _MATRIX[id(q)] = _prepare(q)
+    return hit[1] is not None
+
+
+def matrix(x: mx.array, q: "Q") -> mx.array | None:
+    """x [R, K] bf16 on the matrix kernel ``choose`` gave this linear, any row count; None keeps the row kernels."""
+
+    if x.dtype != mx.bfloat16 or not on_matrix(q):
+        return None
+    hit = _MATRIX[id(q)]
+    kind = hit[1]
+    if kind == "lane":
+        from tensorfold.kernels.qwen.dense.v1 import lane_qmm
+
+        _, _, tiled, sbt, nt, group = hit
+        kwargs = {"tiled": bool(nt), "nt": nt or lane_qmm.NT, "group": group}
+        rows, most = int(x.shape[0]), lane_qmm.MAX_ROWS
+        return (lane_qmm.lane_matmul(x, tiled, sbt, **kwargs) if rows <= most else
+                mx.concatenate([lane_qmm.lane_matmul(x[i:i + most], tiled, sbt, **kwargs)
+                                for i in range(0, rows, most)]))
+    _, _, scales, biases, group = hit
+    if kind == "g128":
+        from tensorfold.kernels.qwen.dense.v1 import simd_qmm_bits
+
+        return simd_qmm_bits.qmm(x, q.weight, scales, biases, 4, 128)
+    return _backend()(x, q.weight, scales, biases, group, q.bits)
+
+
 def project(x: mx.array, q: Any, *, rows_exact: bool) -> mx.array:
-    """x [R, K] through a linear: one row by MLX's call, a decode window by ``qmv_rows`` where it fits, else by row."""
+    """x [R, K] through a linear: decode rows on the matrix kernel where ``choose`` says, else MLX's one-row bits."""
 
     rows = int(x.shape[0])
+    if rows_exact and isinstance(q, QSplit) and on_matrix(q):           # each part its own kernel, one row too
+        return mx.concatenate([project(x, p, rows_exact=True) for p in q.parts], axis=-1)
+    if rows_exact and isinstance(q, Q):                                 # the kernel its shape takes (``choose``)
+        y = matrix(x, q)
+        if y is not None:
+            return y
     if rows == 1 or not rows_exact:
         return q(x)
     if isinstance(q, QSplit):

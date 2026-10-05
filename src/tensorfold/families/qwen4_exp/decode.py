@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import mlx.core as mx
@@ -10,7 +9,7 @@ import mlx.nn as nn
 import numpy as np
 
 from tensorfold.families.qwen3_5 import tensor_units
-from tensorfold.kernels.qwen.dense.v1 import lane_qmm, simd_qmm
+from tensorfold.kernels.qwen.dense.v1 import lane_qmm
 from tensorfold.kernels.qwen.flash_next.v1 import attention, base, embed, experts, gdn, hc, ngram, rows
 
 
@@ -79,9 +78,8 @@ def first(a: mx.array) -> mx.array:
     return a.reshape(a.shape[1:])
 
 
-_checked: set[tuple[int, int, int]] = set()
-# "lane": lane_qmm. "rows": per-row kernels. "simd": 4-bit groups of 32. "matrix": every width before M5.
-DENSE = os.environ.get("TF_FLASH_DENSE") or ("lane" if tensor_units() else "rows")
+# "lane": lane_qmm on M5. "rows": before M5, each projection's kernel by its format and shape (``choose``).
+DENSE = "lane" if tensor_units() else "rows"
 _lane: dict[int, tuple[mx.array, mx.array, mx.array, int]] = {}   # id(linear) -> weight, tiled copy, scales, tile
 
 
@@ -112,7 +110,7 @@ def _lane_project(x: mx.array, linear: Any) -> mx.array:
     return mx.concatenate(parts).reshape(*x.shape[:-1], -1)
 
 
-_matrix: dict[int, tuple[mx.array, mx.array, mx.array, int]] = {}   # id(linear) -> weight, scales, biases, group
+_matrix: dict[int, tuple] = {}   # id(linear) -> weight, scales, biases, group, native groups of 128
 _MATRIX_BACKEND: Any = None
 
 
@@ -128,21 +126,35 @@ def _matrix_project(x: mx.array, linear: Any) -> mx.array:
     hit = _matrix.get(id(linear))
     if hit is None or hit[0] is not weight:
         scales, biases, group = linear.scales, linear.biases, int(linear.group_size)
-        if group == 128 and int(linear.bits) == 4:  # 4-bit still reads a group of 128 as two of 64
-            scales, biases, group = mx.repeat(scales, 2, axis=1), mx.repeat(biases, 2, axis=1), 64
+        native = False
+        if group == 128 and int(linear.bits) == 4:
+            from tensorfold.kernels.qwen.dense.v1 import simd_qmm_bits
+
+            # one scale load a group of 128 where the one-row twin checks equal; else two groups of 64
+            native = (simd_qmm_bits.reads(weight, scales, biases, 128, 4)
+                      and simd_qmm_bits.check(weight, scales, biases, 4, 128))
+            if not native:
+                scales, biases, group = mx.repeat(scales, 2, axis=1), mx.repeat(biases, 2, axis=1), 64
         mx.eval(scales, biases)
-        _MATRIX_BACKEND.prepare([(weight, scales, biases, group, int(linear.bits))])
-        hit = _matrix[id(linear)] = (weight, scales, biases, group)
-    _, scales, biases, group = hit
+        if not native:
+            _MATRIX_BACKEND.prepare([(weight, scales, biases, group, int(linear.bits))])
+        hit = _matrix[id(linear)] = (weight, scales, biases, group, native)
+    _, scales, biases, group, native = hit
     k = int(x.shape[-1])
     rows = x.size // k
     most = _MATRIX_BACKEND.max_rows
+
+    def run(part: mx.array) -> mx.array:
+        if native:
+            from tensorfold.kernels.qwen.dense.v1 import simd_qmm_bits
+
+            return simd_qmm_bits.qmm(part, weight, scales, biases, 4, 128)
+        return _MATRIX_BACKEND(part, weight, scales, biases, group, int(linear.bits))
+
     if rows <= most:
-        return _MATRIX_BACKEND(x, weight, scales, biases, group, int(linear.bits))
+        return run(x)
     flat = x.reshape(rows, k)
-    parts = [_MATRIX_BACKEND(flat[i:i + most], weight, scales, biases, group, int(linear.bits))
-             for i in range(0, rows, most)]
-    return mx.concatenate(parts).reshape(*x.shape[:-1], -1)
+    return mx.concatenate([run(flat[i:i + most]) for i in range(0, rows, most)]).reshape(*x.shape[:-1], -1)
 
 
 def unreadable(*models: Any) -> dict[str, int]:
@@ -159,16 +171,23 @@ def unreadable(*models: Any) -> dict[str, int]:
     return counts
 
 
-def _default_matrix(linear: Any) -> bool:
-    """Unset switch: the fused GDN stack, 4-bit group 64 at 16480 x 2560, uses the matrix kernel."""
+def choose(bits: int, group: int, n: int, k: int) -> bool:
+    """Whether a projection before M5 takes the matrix kernels, not the row kernels, by its format and shape."""
 
-    if os.environ.get("TF_FLASH_DENSE") or DENSE != "rows":
+    if n % 8 or k % group:
         return False
-    if (int(linear.bits), int(linear.group_size)) != (4, 64):
+    return (bits == 4 and group in (64, 128)) or (bits in (5, 6, 8) and group in (64, 128))
+
+
+def _default_matrix(linear: Any) -> bool:
+    """Before M5: the matrix kernels where ``choose`` takes the projection's format and shape."""
+
+    if DENSE != "rows":
         return False
+    bits, group = int(linear.bits), int(linear.group_size)
     n = int(linear.weight.shape[0])
-    k = int(linear.weight.shape[1]) * 32 // int(linear.bits)
-    return n == 16480 and k == 2560
+    k = int(linear.weight.shape[1]) * 32 // bits
+    return choose(bits, group, n, k)
 
 
 def project(x: mx.array, linear: Any) -> mx.array:
@@ -178,21 +197,11 @@ def project(x: mx.array, linear: Any) -> mx.array:
         return linear(x)
     if DENSE == "lane":
         return _lane_project(x, linear)
-    if DENSE == "matrix" or _default_matrix(linear):        # before M5: every width on the matrix units
+    if _default_matrix(linear):                              # before M5: the matrix kernels where the shape takes them
         return _matrix_project(x, linear)
     if (linear.bits, linear.group_size) != (4, 32):         # other widths before M5: every row alone, at any count
         return rows.qmv_rows(x, linear)
-    if DENSE == "rows":
-        return linear(x) if x.size // x.shape[-1] == 1 else rows.qmv_rows(x, linear)
-    weight = linear.weight
-    shape = (int(weight.shape[0]), int(weight.shape[1]) * 8, int(linear.group_size))
-    if shape not in _checked:
-        if not simd_qmm.fits(linear):
-            raise ValueError(f"simd_qmm does not take a {shape} linear ({linear.bits}-bit, group {linear.group_size})")
-        if not simd_qmm.check(weight, linear.scales, linear.biases, group_size=linear.group_size):
-            simd_qmm.mma_one_row.add(shape)
-        _checked.add(shape)
-    return simd_qmm.qmm(x, weight, linear.scales, linear.biases, linear.group_size)
+    return linear(x) if x.size // x.shape[-1] == 1 else rows.qmv_rows(x, linear)
 
 
 _NONE: tuple[str, tuple[mx.array, ...], Any] = ("none", (), None)

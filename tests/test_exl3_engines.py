@@ -90,7 +90,9 @@ def test_admission_counts_a_layer_major_prompts_residual_stream_by_slots():
     from tensorfold.cuda.capacity import Geometry
     from tensorfold.families.qwen3_5.cuda.exl3_load import admission
 
-    text = {"hidden_size": 5120, "intermediate_size": 17408}
+    text = {"hidden_size": 5120, "intermediate_size": 17408, "num_attention_heads": 24, "head_dim": 256,
+            "linear_num_key_heads": 16, "linear_num_value_heads": 48, "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128}      # the 27B's; the fleet workspace reads the attention widths
     base = Geometry(lambda slots: 1000 + 7 * slots, 64, 128)
     plain, _ = admission(lambda _: base)
     major, _ = admission(lambda _: base, layer_major=True)

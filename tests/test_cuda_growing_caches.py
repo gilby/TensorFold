@@ -70,7 +70,7 @@ def stream(multi, state, torch, sid: int, pos: int):
     return SimpleNamespace(sid=sid, st=st, drafts=[], done=False, waiting=False, out=[1] * 5, error=None)
 
 
-def test_the_newest_waits_for_room_then_the_newest_ends_when_even_the_oldest_cannot_grow(allocations):  # noqa: F811
+def test_the_newest_waits_for_room_then_gives_way_when_even_the_oldest_cannot_grow(allocations):  # noqa: F811
     import torch
 
     state = importlib.import_module("tensorfold.families.qwen4_exp.cuda.state")
@@ -84,7 +84,7 @@ def test_the_newest_waits_for_room_then_the_newest_ends_when_even_the_oldest_can
     assert old.st.capacity == 8192 and new.st.capacity == 256
     old.st.set_pos(8190)                                                 # the oldest needs its next step now
     ended = dec._make_room()
-    assert ended == [new] and new.done and "ran out of memory" in str(new.error)
+    assert ended == [new] and new.done and new.preempted and new.error is None       # replayed later, not refused
     assert dec.memory_gate.ends == 1 and 1 not in dec.streams and new.st in dec.free
     assert not old.waiting and old.st.capacity == 16384                 # alone, it grows: startup fits one window
 

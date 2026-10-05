@@ -15,6 +15,7 @@
 //
 // Layout (``Tiled``): words [N/32][K/64][32 columns][WPG] with WPG = 8 (NVFP4), 16 (FP8), 32 (F16) 32-bit words of
 // one 64-input group of one column; NVFP4 scales [N/32][K/64][32] as one word (four e4m3 bytes, inputs 0-15 first).
+// K may end in a 32-input half group: its words are zero past K and the kernel stops at K.
 //
 // Decode (``qmmf884s_kernel``): a block takes 128 columns and one K slice; each 64-input group's rows of its 8-row
 // tiles are staged in shared memory three groups ahead, the weights stream one group ahead in registers, every tile
@@ -116,7 +117,7 @@ __global__ void __launch_bounds__(THREADS) qmmf884s_kernel(
     const int q = (lane >> 2) & 3, idx = (lane & 3) + 4 * (lane >= 16);
     const int s = blockIdx.y, m0 = blockIdx.z * 8 * MT;
     const int g0 = s * gper, g1 = g0 + gper;
-    const int KG = K / 64, K8 = K / 8;
+    const int KG = (K + 63) / 64, K8 = K / 8;
     const int cbase = blockIdx.x * COLS + warp * 32 + q * 8;
     const int col = cbase + idx;
     const bool nok = col < N;
@@ -135,7 +136,7 @@ __global__ void __launch_bounds__(THREADS) qmmf884s_kernel(
 #pragma unroll
         for (int j = 0; j < PER; ++j) {
             const int e = threadIdx.x + j * THREADS, t = e >> 6, c = e & 63;
-            r[j] = (e < MT * 64 && t < tiles && g < g1)
+            r[j] = (e < MT * 64 && t < tiles && g < g1 && g * 8 + (c >> 3) < K8)
                 ? __ldg(reinterpret_cast<const int4*>(X + ((long)((m0 >> 3) + t) * K8 + g * 8) * 64) + c)
                 : make_int4(0, 0, 0, 0);
         }
@@ -175,8 +176,10 @@ __global__ void __launch_bounds__(THREADS) qmmf884s_kernel(
             for (int j = 0; j < 4; ++j) s2[j] = e4m3_h2((cur.s >> (8 * j)) & 0xFFu);
         }
         const __half* stage = &sa[i % STAGES][0][0];
+        const int steps = min(8, K8 - g * 8);                       // 4 in a 32-input tail group
 #pragma unroll
         for (int wi = 0; wi < 8; ++wi) {
+            if (wi >= steps) continue;
             const int4 o = expand<FMT>(cur, wi, s2);
 #pragma unroll
             for (int t = 0; t < MT; ++t) {
@@ -248,7 +251,7 @@ template <int FMT>
 __global__ void dequant_kernel(const int* __restrict__ W, const unsigned* __restrict__ S, __half* __restrict__ out,
                                int N, int K) {
     constexpr int WPG = Words<FMT>::n;
-    const int k8 = K / 8, kg = K / 64;
+    const int k8 = K / 8, kg = (K + 63) / 64;
     const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;      // n * k8 + piece
     if (idx >= (long)N * k8) return;
     const long n = idx / k8;
@@ -287,6 +290,8 @@ __global__ void gather_rows_kernel(const long* __restrict__ ids, const uint4* __
 // expert, never on which pairs share its item or launch. Weights [E][N/32][K/64][32 columns][MM][8 words] (MM = 2:
 // gate and up of one column side by side, SwiGLU in the epilogue), scales [E][N/32][K/64][32][MM], one fp32 factor a
 // (expert, matrix). The K split is a function of the shape; the last slice to finish adds the slices in order.
+// A K that ends in 32 inputs keeps that tail group packed after the whole ones of its column tile: words
+// [32][MM][4] and scales as 16-bit pairs [32][MM], nothing stored past K.
 
 constexpr int EX_ROWS = 8;           // pairs an item
 
@@ -352,21 +357,30 @@ __global__ void __launch_bounds__(THREADS) experts884_kernel(
     const int q = (lane >> 2) & 3, idx = (lane & 3) + 4 * (lane >= 16);
     const int s = blockIdx.z;
     const int g0 = s * gper, g1 = g0 + gper;
-    const int KG = K / 64, N32 = N / 32;
+    const int KF = K / 64, KT = (K % 64) / 32, N32 = N / 32;           // whole groups, a 32-input tail group or none
     const int cbase = blockIdx.y * COLS + warp * 32 + q * 8;
     const int col = cbase + idx;
     const bool nok = col < N;
-    const int c32 = nok ? col : 0;
-    const long cell0 = (((long)e * N32 + (c32 >> 5)) * KG) * 32 + (c32 & 31);       // (expert, tile, group 0, column)
-    const int4* wp = reinterpret_cast<const int4*>(W + cell0 * MM * 8);
-    const unsigned* sp = S + cell0 * MM;
-    constexpr long WSTEP = 32 * MM * 8 / 4;                                         // int4s between groups
-    constexpr long SSTEP = 32 * MM;
+    const int c32 = nok ? col : 0, cc = c32 & 31;
+    const long tile = (long)e * N32 + (c32 >> 5);                                   // (expert, column tile)
+    const int* wt = W + tile * (32L * MM * (8 * KF + 4 * KT));
+    const unsigned* st = S + tile * (32L * MM * KF + 16L * MM * KT);
+    auto load = [&](Group<FP4>& gr, int g, int m, bool ok) {
+        if (g < KF) {
+            load_group<FP4>(gr, reinterpret_cast<const int4*>(wt + ((long)g * 32 + cc) * MM * 8 + m * 8),
+                            st + ((long)g * 32 + cc) * MM + m, ok);
+        } else {                                                                    // the tail: four words a column
+            gr.w[0] = ok ? __ldcs(reinterpret_cast<const int4*>(wt + 32L * MM * 8 * KF + (cc * MM + m) * 4))
+                         : make_int4(0, 0, 0, 0);
+            gr.w[1] = make_int4(0, 0, 0, 0);
+            gr.s = ok ? (unsigned)__ldg(reinterpret_cast<const unsigned short*>(st + 32L * MM * KF) + cc * MM + m) : 0u;
+        }
+    };
 
     // staging: thread c < 64 copies k-step c / 8 of pair row c % 8 (eight inputs) into fragment order
     auto fetch = [&](int g, int4& r) {
         const int c = threadIdx.x, row = c & 7, ks = c >> 3;
-        r = (c < 64 && g < g1 && src[row] >= 0)
+        r = (c < 64 && g < g1 && src[row] >= 0 && g * 64 + ks * 8 < K)
             ? __ldg(reinterpret_cast<const int4*>(X + (long)src[row] * K + g * 64 + ks * 8))
             : make_int4(0, 0, 0, 0);
     };
@@ -390,15 +404,15 @@ __global__ void __launch_bounds__(THREADS) experts884_kernel(
             for (int i = 0; i < 8; ++i) acc[m][a][i] = 0.f;
     Group<FP4> cur[MM], nxt[MM];
 #pragma unroll
-    for (int m = 0; m < MM; ++m) load_group<FP4>(cur[m], wp + g0 * WSTEP + m * 2, sp + (long)g0 * SSTEP + m, nok);
+    for (int m = 0; m < MM; ++m) load(cur[m], g0, m, nok);
     for (int g = g0; g < g1; ++g) {
         const int i = g - g0;
 #pragma unroll
-        for (int m = 0; m < MM; ++m)
-            load_group<FP4>(nxt[m], wp + (g + 1) * WSTEP + m * 2, sp + (long)(g + 1) * SSTEP + m, nok && g + 1 < g1);
+        for (int m = 0; m < MM; ++m) load(nxt[m], g + 1, m, nok && g + 1 < g1);
         int4 ahead;
         fetch(g + AHEAD, ahead);
         const __half* stage = sa[i % STAGES];
+        const int steps = g < KF ? 8 : 4;
 #pragma unroll
         for (int m = 0; m < MM; ++m) {
             __half2 s2[4];
@@ -406,6 +420,7 @@ __global__ void __launch_bounds__(THREADS) experts884_kernel(
             for (int j = 0; j < 4; ++j) s2[j] = e4m3_h2((cur[m].s >> (8 * j)) & 0xFFu);
 #pragma unroll
             for (int wi = 0; wi < 8; ++wi) {
+                if (wi >= steps) continue;
                 const int4 o = expand<FP4>(cur[m], wi, s2);
                 const uint4 a = *reinterpret_cast<const uint4*>(stage + wi * 64 + idx * 8);
                 mma884(acc[m][0], a.x, a.y, (unsigned)o.x, (unsigned)o.y);
@@ -486,7 +501,8 @@ void qmmf884s(torch::Tensor x16, torch::Tensor rs, torch::Tensor w, torch::Tenso
     TORCH_CHECK(x16.is_contiguous() && w.is_contiguous() && s.is_contiguous() && out.is_contiguous() &&
                 alpha.is_contiguous() && alpha.scalar_type() == at::kFloat && alpha.numel() >= N, "qmmf884s: tensors");
     const int wpg = fmt == FP4 ? 8 : fmt == FP8 ? 16 : 32;
-    TORCH_CHECK(K % 64 == 0 && (K / 64) % sk == 0 && w.numel() >= (long)((N + 31) / 32) * 32 * (K / 64) * wpg,
+    const int kg = (K + 63) / 64;
+    TORCH_CHECK(K % 32 == 0 && kg % sk == 0 && w.numel() >= (long)((N + 31) / 32) * 32 * kg * wpg,
                 "qmmf884s: bad K, K split or weight size");
     if (M == 0) return;
     const auto stream = at::cuda::getCurrentCUDAStream();
@@ -501,7 +517,7 @@ void qmmf884s(torch::Tensor x16, torch::Tensor rs, torch::Tensor w, torch::Tenso
         TORCH_CHECK(cnt.scalar_type() == at::kInt && cnt.numel() >= (long)grid.x * grid.z, "qmmf884s: too few counters");
         c = cnt.data_ptr<int>();
     }
-    const int gper = K / 64 / sk;
+    const int gper = kg / sk;
     const auto X = reinterpret_cast<const __half*>(x16.data_ptr<at::Half>());
     const auto Sp = reinterpret_cast<const unsigned*>(s.data_ptr<int>());
 #define QS1(F, MTV, NA) qmmf884s_kernel<F, MTV, NA><<<grid, THREADS, 0, stream>>>( \
@@ -555,7 +571,7 @@ void experts884(int64_t epi, torch::Tensor x16, torch::Tensor rs, torch::Tensor 
                 torch::Tensor part, torch::Tensor cnt, int64_t n, int64_t sk, int64_t max_items, double limit) {
     TORCH_CHECK(x16.dim() == 2 && x16.is_contiguous() && x16.scalar_type() == at::kHalf, "experts884: fp16 rows");
     const int K = x16.size(1);
-    TORCH_CHECK(K % 64 == 0 && (K / 64) % sk == 0 && sk <= 4 && n % 32 == 0, "experts884: shape or K split");
+    TORCH_CHECK(K % 32 == 0 && ((K + 63) / 64) % sk == 0 && sk <= 4 && n % 32 == 0, "experts884: shape or K split");
     if (max_items == 0) return;
     const dim3 grid((unsigned)max_items, (unsigned)((n + COLS - 1) / COLS), (unsigned)sk);
     TORCH_CHECK(sk == 1 || cnt.numel() >= (long)grid.x * grid.y, "experts884: too few counters");
@@ -565,7 +581,7 @@ void experts884(int64_t epi, torch::Tensor x16, torch::Tensor rs, torch::Tensor 
         rs.data_ptr<float>(), w.data_ptr<int>(), reinterpret_cast<const unsigned*>(s.data_ptr<int>()), alpha.data_ptr<float>(), \
         members.data_ptr<int>(), items.data_ptr<int>(), counts.data_ptr<int>(), (int)slots, out.data_ptr(), \
         sk > 1 ? part.data_ptr<float>() : nullptr, sk > 1 ? cnt.data_ptr<int>() : nullptr, pairs_cap, (int)n, K, \
-        K / 64 / (int)sk, (int)sk, (float)limit)
+        (K + 63) / 64 / (int)sk, (int)sk, (float)limit)
     if (epi == 2) EX(2); else if (epi == 0) EX(0); else EX(3);
 #undef EX
     C10_CUDA_KERNEL_LAUNCH_CHECK();

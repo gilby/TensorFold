@@ -385,3 +385,90 @@ def test_planned_growth_counts_prior_copies_under_the_explicit_cap(monkeypatch):
     monkeypatch.setattr(multi_plan, "cuda_limit_bytes", lambda: 180000)
     assert not ready(d, {"actions": [["resize", 2, 1024, "alone"], ["resize", 1, 1024, "alone"]]})
     assert all(st.capacity == 256 and not st.operations for st in d.slots)
+
+
+def _two_growing(d):
+    old = Stream([7], 40, sid=0, st=d.slots[0], out=[3])
+    new = Stream([8], 40, sid=1, st=d.slots[1], out=[4])
+    old.st.pos = new.st.pos = 255                       # both need their next rows: 256 -> 1024
+    d.streams, d.free = {0: old, 1: new}, [d.slots[2]]
+    return old, new
+
+
+def test_a_round_one_rank_refuses_is_planned_again_within_the_fullest_ranks_memory(monkeypatch):
+    """The leader's own gate fits both growths; the follower's fits one. The refused plan is redone within the
+    follower's reported room (the oldest grows, the newest waits) instead of failing every live request."""
+
+    from tensorfold.families.qwen4_exp.cuda import multi_plan, multi_tp
+
+    leader, follower = decoder(), decoder()
+    old, new = _two_growing(leader)
+    _two_growing(follower)
+    step = 2 * 768 * 100 + 1024 * 100                     # one stream's growth and its layer copy
+    leader.memory_gate.room, follower.memory_gate.room = 10 * step, step + 100
+    real_ready, plans, sent = multi_plan.ready, [], []
+
+    def spy(dec, plan):
+        if dec is leader:
+            plans.append(plan)
+        return real_ready(dec, plan)
+
+    def gather(torch, all_gather, values, world):
+        g = follower.memory_gate
+        return [list(values), [values[0], (1 << 62) - g.reserve, g.room - g.reserve - g.held,
+                               int(real_ready(follower, plans[-1]))]]
+
+    monkeypatch.setattr(multi_plan, "ready", spy)
+    monkeypatch.setattr(multi_tp, "gather_ints", gather)
+    leader.w.comm, leader.link = SimpleNamespace(world=2, all_gather=None), SimpleNamespace(send=sent.append)
+    ended, solo = leader._prepare_round(None)
+    assert ended == [] and len(sent) == 2                 # the refused plan, then the one every rank fits
+    assert real_ready(follower, sent[-1][2])
+    assert old.st.capacity == 1024 and not old.waiting and new.waiting and new.st.capacity == 256
+
+
+def test_a_round_no_rank_can_grow_pauses_growth_instead_of_failing(monkeypatch):
+    from tensorfold.families.qwen4_exp.cuda import multi_plan, multi_tp
+
+    leader = decoder()
+    old, new = _two_growing(leader)
+    leader.memory_gate.room = 10 * (2 * 768 * 100 + 1024 * 100)
+    real_ready, plans, sent = multi_plan.ready, [], []
+    monkeypatch.setattr(multi_plan, "ready", lambda dec, plan: (plans.append(plan), real_ready(dec, plan))[1])
+
+    def gather(torch, all_gather, values, world):        # a follower that refuses every growth, reporting room
+        grows = any(op[0] == "resize" for op in plans[-1]["actions"])
+        return [list(values), [values[0], 1 << 40, 1 << 40, int(not grows)]]
+
+    monkeypatch.setattr(multi_tp, "gather_ints", gather)
+    leader.w.comm, leader.link = SimpleNamespace(world=2, all_gather=None), SimpleNamespace(send=sent.append)
+    ended, _ = leader._prepare_round(None)
+    assert ended == [] and len(sent) == 3 and not old.done and not new.done
+    assert old.waiting and new.waiting and old.st.capacity == new.st.capacity == 256
+
+
+def test_an_admission_one_rank_refuses_waits_after_a_plan_within_the_fullest_ranks_memory(monkeypatch):
+    """With a stream live, a prompt the follower can't hold is planned again within the follower's room: there it
+    does not fit either, so the request waits (NoRoom, which the scheduler parks) and no slot grows anywhere."""
+
+    from tensorfold.cuda.memory_gate import NoRoom
+    from tensorfold.families.qwen4_exp.cuda import multi_plan, multi_tp
+
+    leader, follower = decoder(), decoder()
+    for d in (leader, follower):
+        d.streams, d.free = {0: Stream([9], 40, sid=0, st=d.slots[0], out=[3])}, d.slots[1:]
+    leader.memory_gate.room, follower.memory_gate.room = 1 << 30, 100
+    real_ready, plans, sent = multi_plan.ready, [], []
+    monkeypatch.setattr(multi_plan, "ready", lambda dec, plan: (plans.append(plan), real_ready(dec, plan))[1])
+
+    def gather(torch, all_gather, values, world):
+        g = follower.memory_gate
+        return [list(values), [values[0], (1 << 62) - g.reserve, g.room - g.reserve - g.held, 1,
+                               int(real_ready(follower, plans[-1]))]]
+
+    monkeypatch.setattr(multi_tp, "gather_ints", gather)
+    leader.w.comm, leader.link = SimpleNamespace(world=2, all_gather=None), SimpleNamespace(send=sent.append)
+    with pytest.raises(NoRoom, match="waits for memory"):
+        leader._prepare_admission(Stream([7] * 310, 8), None)
+    assert len(sent) == 2 and sent[-1][-1]["error"] and not sent[-1][-1]["actions"]
+    assert all(st.capacity == 256 for st in leader.slots)

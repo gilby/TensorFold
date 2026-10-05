@@ -28,9 +28,11 @@ def quant_config(model_dir: Path) -> dict | None:
     return None
 
 
-def admission(geometry):
-    """An EXL3 pack's admission: the MLX path's geometry plus the prompt matmuls' workspace, and its tensors' bytes."""
+def admission(geometry, layer_major: bool = False):
+    """An EXL3 pack's admission: the MLX path's geometry plus the prompt matmuls' workspace, and its tensors' bytes.
+    ``layer_major``: a prompt run layer by layer keeps each row's residual stream (4 * hidden bytes) live."""
 
+    from tensorfold.cuda.capacity import Geometry
     from tensorfold.cuda.geometry import exl3_weights, exl3_workspace, with_fixed
 
     def with_workspace(text):
@@ -44,7 +46,10 @@ def admission(geometry):
         nk, nv = int(text.get("linear_num_key_heads", 0)), int(text.get("linear_num_value_heads", 0))
         dk, dv = int(text.get("linear_key_head_dim", 0)), int(text.get("linear_value_head_dim", 0))
         widest = max(i, 2 * heads * hd, 2 * nk * dk + nv * dv)   # a MoE's widest prompt projection is attention's
-        return with_fixed(geometry(text), exl3_workspace(d * widest, CHUNK, max(d, i, heads * hd, nv * dv)))
+        fixed = with_fixed(geometry(text), exl3_workspace(d * widest, CHUNK, max(d, i, heads * hd, nv * dv)))
+        if not layer_major:
+            return fixed
+        return Geometry(lambda slots: fixed.bytes_at(slots) + 4 * d * slots, fixed.reserve, fixed.minimum_slots)
 
     return with_workspace, exl3_weights
 

@@ -84,6 +84,22 @@ def test_admission_counts_an_exl3_pack_as_loaded():
     assert indexed_weights(1, True)("model.visual.merger.fc.weight", {"dtype": "BF16", "shape": [8, 8]}) == (0, 0)
 
 
+def test_admission_counts_a_layer_major_prompts_residual_stream_by_slots():
+    """A prompt of several chunks runs layer by layer, so every row's layer input and MLP output (bf16) stay live
+    between layers: the admission grows by 4 * hidden bytes a slot, and only when layer-major applies."""
+    from tensorfold.cuda.capacity import Geometry
+    from tensorfold.families.qwen3_5.cuda.exl3_load import admission
+
+    text = {"hidden_size": 5120, "intermediate_size": 17408}
+    base = Geometry(lambda slots: 1000 + 7 * slots, 64, 128)
+    plain, _ = admission(lambda _: base)
+    major, _ = admission(lambda _: base, layer_major=True)
+    for slots in (4096, 131200):
+        assert major(text).bytes_at(slots) - plain(text).bytes_at(slots) == 2 * slots * 5120 * 2
+    assert (major(text).reserve, major(text).minimum_slots) == (plain(text).reserve, plain(text).minimum_slots)
+    assert major(text).needed(131072) - plain(text).needed(131072) == 4 * 5120 * (131072 + 64)
+
+
 @pytest.mark.parametrize("suffix", ["shard_0.trellis", "trellis"])
 def test_extra_files_add_their_mapped_pages(tmp_path, suffix):
     from tensorfold.cuda.capacity import estimate_weights

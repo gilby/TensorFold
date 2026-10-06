@@ -189,7 +189,7 @@ class CacheMemory:
             per_token += each * (2 if alternating else 1) + auxiliary
             entry = max(entry, each + auxiliary)
             step = max(step, int(getattr(item, "step", 256)),
-                       int(getattr(item, "grow", 256)) if alternating else 256)
+                       int(getattr(item, "grow", 256)))
         return cls(fixed, per_token, step, entry)
 
     def cache_bytes(self, tokens: int) -> int:

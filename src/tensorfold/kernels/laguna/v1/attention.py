@@ -29,8 +29,10 @@ def split_for(heads: int, kv_heads: int, dims: int) -> int:
 
 
 def attend(q: mx.array, keys: mx.array, values: mx.array, rows: Rows, new_keys: mx.array, new_values: mx.array,
-           scale: float = 1.0) -> mx.array:
-    """q [R, H, D] over its rows' new keys [Hk, R, D] and the earlier ones in [1, Hk, CAP, D] buffers: [R, H, D]."""
+           scale: float = 1.0, after: mx.array | None = None) -> mx.array:
+    """q [R, H, D] over its rows' new keys [Hk, R, D] and the earlier ones in [1, Hk, CAP, D] buffers: [R, H, D].
+
+    ``after``: the marker of an in-place write to the buffers, which the partials wait for."""
 
     count, heads, dims = (int(s) for s in q.shape)
     kv_heads = int(keys.shape[1])
@@ -42,13 +44,13 @@ def attend(q: mx.array, keys: mx.array, values: mx.array, rows: Rows, new_keys: 
     consts = (("D", dims), ("G", group), ("HK", kv_heads), ("CK", chunk), ("S", split), ("BLK", block),
               ("SCALE", float(scale)))
     slots = heads * count * rows.chunks
-    pm, pl, po = gemma._partial(consts, inputs=[q, keys, values, new_keys, new_values, rows.positions, rows.lows,
-                                                rows.meta],
-                                grid=(32 * group * split * rows.chunks, kv_heads, count),
-                                threadgroup=(32 * group * split, 1, 1),
-                                output_shapes=[(max(slots, MIN_ELEMENTS),), (max(slots, MIN_ELEMENTS),),
-                                               (slots, dims)],
-                                output_dtypes=[mx.float32, mx.float32, mx.float32])
+    inputs = [q, keys, values, new_keys, new_values, rows.positions, rows.lows, rows.meta]
+    partial = gemma._partial if after is None else gemma._partial_after
+    pm, pl, po = partial(consts, inputs=inputs if after is None else inputs + [after],
+                         grid=(32 * group * split * rows.chunks, kv_heads, count),
+                         threadgroup=(32 * group * split, 1, 1),
+                         output_shapes=[(max(slots, MIN_ELEMENTS),), (max(slots, MIN_ELEMENTS),), (slots, dims)],
+                         output_dtypes=[mx.float32, mx.float32, mx.float32])
     return gemma._merge((("D", dims), ("H", heads)), inputs=[pm, pl, po, rows.meta],
                         grid=(32, heads, count), threadgroup=(32, 1, 1),
                         output_shapes=[(count, heads, dims)], output_dtypes=[mx.bfloat16])[0]

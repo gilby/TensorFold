@@ -131,8 +131,10 @@ class RowDecode:
             scale = float(self.layers[i].self_attn.scale)
             for s, (caches, n, _) in enumerate(streams):
                 ks, vs = (k, v) if n == rows else (k[:, start:start + n], v[:, start:start + n])
-                keys, values = caches[i].write(ks[None], vs[None])     # the buffers holding every earlier key
-                outs.append(attend(q[start:start + n], keys, values, kinds[s, self.sliding(i)], ks, vs, scale))
+                # the buffers holding every earlier key, and an in-place write's marker the attention waits for
+                held = caches[i].write(ks[None], vs[None])
+                outs.append(attend(q[start:start + n], held[0], held[1], kinds[s, self.sliding(i)], ks, vs, scale,
+                                   held[2] if len(held) > 2 else None))
                 start += n
             out = outs[0] if len(outs) == 1 else mx.concatenate(outs)
             h, normed = self._back(i)(out, gate, h)

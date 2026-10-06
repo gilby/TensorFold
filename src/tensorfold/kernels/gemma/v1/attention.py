@@ -109,6 +109,9 @@ _MERGE = r"""
 
 _partial = Kernel("gemma_attention_partial", _PARTIAL, ["Q", "K", "V", "KN", "VN", "POS", "LO", "META"],
                   ["PM", "PL", "PO"])
+# the same partials ordered after an in-place cache write (its marker, AFTER, is bound and not read)
+_partial_after = Kernel("gemma_attention_partial_after", _PARTIAL,
+                        ["Q", "K", "V", "KN", "VN", "POS", "LO", "META", "AFTER"], ["PM", "PL", "PO"])
 _merge = Kernel("gemma_attention_merge", _MERGE, ["PM", "PL", "PO", "META"], ["OUT"])
 
 # (keys a chunk, simdgroups a query head, keys scored before an update) by head dim: part of the arithmetic
@@ -136,8 +139,10 @@ class Rows:
 
 
 def attend(q: mx.array, keys: mx.array, values: mx.array, rows: Rows, new_keys: mx.array, new_values: mx.array,
-           scale: float = 1.0) -> mx.array:
-    """q [R, H, D] over its rows' new keys [Hk, R, D] and the earlier ones in [1, Hk, CAP, D] buffers: [R, H, D]."""
+           scale: float = 1.0, after: mx.array | None = None) -> mx.array:
+    """q [R, H, D] over its rows' new keys [Hk, R, D] and the earlier ones in [1, Hk, CAP, D] buffers: [R, H, D].
+
+    ``after``: the marker of an in-place write to the buffers, which the partials wait for."""
 
     count, heads, dims = (int(s) for s in q.shape)
     kv_heads = int(keys.shape[1])
@@ -151,7 +156,9 @@ def attend(q: mx.array, keys: mx.array, values: mx.array, rows: Rows, new_keys: 
               ("SCALE", float(scale)))
     slots = heads * count * rows.chunks
     # the merge reads the partials as they are: MIN_ELEMENTS or more keeps one Metal signature at every size
-    pm, pl, po = _partial(consts, inputs=[q, keys, values, new_keys, new_values, rows.positions, rows.lows, rows.meta],
+    inputs = [q, keys, values, new_keys, new_values, rows.positions, rows.lows, rows.meta]
+    partial = _partial if after is None else _partial_after
+    pm, pl, po = partial(consts, inputs=inputs if after is None else inputs + [after],
                           grid=(32 * group * split * rows.chunks, kv_heads, count),
                           threadgroup=(32 * group * split, 1, 1),
                           output_shapes=[(max(slots, MIN_ELEMENTS),), (max(slots, MIN_ELEMENTS),), (slots, dims)],

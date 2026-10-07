@@ -80,8 +80,9 @@ def quantization_refusal(config: dict[str, Any]) -> str:
 
 
 def load(model_dir: Path, *, lane_kernels: str = "auto", drafter: str = "", drafter_bits: int = 8,
-         **_: Any) -> tuple[Any, Any]:
-    """Before M5 each linear's faster of rows and matrix by shape; ``lane_kernels`` "on": lane; ``drafter``: DFlash."""
+         mtp_drafts: int = 0, **_: Any) -> tuple[Any, Any]:
+    """Before M5 each linear's faster of rows and matrix by shape; ``lane_kernels`` "on": lane; ``drafter``: DFlash, or
+    a Gemma 4 MTP assistant drafting up to ``mtp_drafts`` tokens a round (0: its default)."""
 
     import os
 
@@ -90,7 +91,8 @@ def load(model_dir: Path, *, lane_kernels: str = "auto", drafter: str = "", draf
 
     backend = "lane" if str(lane_kernels) == "on" else ("rows" if tensor_units() else "auto")
     backend = os.environ.get("TF_GEMMA_DENSE") or backend      # rows, matrix or auto: for measurements
-    return load_model(Path(model_dir), backend=backend, drafter=drafter, drafter_bits=drafter_bits)
+    return load_model(Path(model_dir), backend=backend, drafter=drafter, drafter_bits=drafter_bits,
+                      drafts=int(mtp_drafts or 0))
 
 
 def engine_settings(model: Any) -> dict[str, Any]:

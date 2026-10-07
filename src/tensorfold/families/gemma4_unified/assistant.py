@@ -135,6 +135,7 @@ class Assistant:
                 begin = max(0, end - self.window)
                 out[kind] = (cache._ordered(cache.ring_keys, begin, end), cache._ordered(cache.ring_values, begin, end))
             else:
+                getattr(cache, "_settle", lambda: None)()      # in-place rows: the last decode write has landed
                 out[kind] = (cache.keys[..., :end, :], cache.values[..., :end, :])
         return out
 

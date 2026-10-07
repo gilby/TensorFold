@@ -458,6 +458,7 @@ def _serve_mlx(args: argparse.Namespace, family: Any, model_dir: Path, context: 
     # prompt chunks start where replies begin too, so a follow-up resumes where its latest reply began
     openers, assistant = message_markers(tokenizer)
     steps = engine_kwargs.pop("prefill_steps", None) or (LaneEngine.prefill_step,)
+    steps = (prefill_step.requested(),) if prefill_step.requested() else steps
     step = prefill_step.choose(lambda grid: LaneEngine(model, prefill_plan=PrefillPlan(grid)), steps,
                                memory_limit - PROCESS_BYTES, probe_tokens(tokenizer), context)
     plan = PrefillPlan(step, openers, MIN_CHUNK, assistant)

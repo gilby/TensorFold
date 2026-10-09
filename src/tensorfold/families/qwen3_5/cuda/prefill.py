@@ -100,7 +100,11 @@ def _read(w: Weights, cache: torch.Tensor, n: int) -> torch.Tensor:
     """The first ``n`` rows a prompt's attention reads: an int8 cache's dequantized in the model's basis, so every key
     (the chunk's own too) passes through its stored codes and any chunking keeps the same bits."""
 
-    return kvpack.unpack(cache[:n], w.config.head_dim) if w.kv_dtype == "int8" else cache
+    if w.kv_dtype != "int8":
+        return cache
+    from tensorfold.cuda.kernels.prefill_attention import reads_packed
+
+    return cache[:n] if reads_packed(cache.device) else kvpack.unpack(cache[:n], w.config.head_dim)
 
 
 def prefill_chunk(w: Weights, tokens: torch.Tensor, st: State, *, tp: bool = False, capture_taps: bool = False,

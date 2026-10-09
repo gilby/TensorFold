@@ -158,11 +158,11 @@ def _sub_parts(head, spans: tuple[tuple[int, int], ...]) -> list[tuple[object, i
     return parts
 
 
-def _rank_spans(spans: tuple[tuple[int, int], ...], rank: int) -> tuple[tuple[int, int], ...]:
-    """Rank ``rank``'s half of the draft vocabulary (rank 0 the first ceil(n/2) ids), as head row spans."""
+def _rank_spans(spans: tuple[tuple[int, int], ...], rank: int, world: int = 2) -> tuple[tuple[int, int], ...]:
+    """Rank ``rank``'s share of the draft vocabulary (each rank ceil(n/world) ids in order), as head row spans."""
 
     total = sum(b - a for a, b in spans)
-    half = -(-total // 2)
+    half = -(-total // world)
     lo, hi = rank * half, min((rank + 1) * half, total)
     out, at = [], 0
     for a, b in spans:
@@ -202,9 +202,10 @@ class DFlash2:
     def __init__(self, draft_dir: str | Path, target: Weights, bits: int = 4, block: int = 16,
                  fast: bool = True, rank: int = 0, world: int = 1):
         path = Path(draft_dir)
-        # Two-rank drafting requires both ranks to call propose_tree/add_taps together on the fused path with ordered partial sums.
-        if world not in (1, 2) or (world == 2 and not (fast and bits == 4)):
-            raise ValueError("a two-rank drafter needs world=2 with the fused 4-bit path")
+        # Drafting on several ranks requires every rank to call propose_tree/add_taps together on the fused path with
+        # ordered partial sums: each holds its share of the heads, the MLP and the draft vocabulary.
+        if world not in (1, 2, 4) or (world > 1 and not (fast and bits == 4)):
+            raise ValueError("a drafter on several ranks needs two or four of them and the fused 4-bit path")
         self.rank, self.world = rank, world
         self.block = block          # masked positions drafted per round (the checkpoint trained with 8)
         cfg = json.loads((path / "config.json").read_text())
@@ -253,14 +254,12 @@ class DFlash2:
         self.sub_rows: list[QLinear] | None = None           # one GPU, tiled head: its rows as views, no copy
         self.sub_parts: list | None = None                   # an NVFP4 checkpoint's head: tile views and span columns
         if target.quant == "nvfp4":
-            if world == 2:                               # this rank's half of the draft vocabulary, still as views
-                spans = _rank_spans(spans, rank)
+            if world > 1:                                # this rank's share of the draft vocabulary, still as views
+                spans = _rank_spans(spans, rank, world)
                 self.head_ids = torch.cat([torch.arange(a, b, device=self.device) for a, b in spans])
             self.sub_parts = _sub_parts(target.head, spans)
-            if world == 2:                               # own copies of bf16 rows: the unsplit head is freed after load
-                # (an sm_70 head's tile views too: ``VoltaLinear.copy``)
-                self.sub_parts = [(Plain(p.weight.clone()) if isinstance(p, Plain) else
-                                   p.copy() if hasattr(p, "copy") else p, lo, hi) for p, lo, hi in self.sub_parts]
+            if world > 1:                                # own copies of bf16 rows: the unsplit head is freed after load
+                self.own_head()
             return
         elif isinstance(target.head, Exl3):
             if world != 1:
@@ -275,8 +274,8 @@ class DFlash2:
                      for t in (head.weight, head.scales, head.biases)]
             self.sub_head = QLinear(*parts, layout=head.layout, gs=head.gs, bits=head.bits)
             del head
-        if world == 2:
-            half = -(-len(self.head_ids) // 2)
+        if world > 1:
+            half = -(-len(self.head_ids) // world)
             lo, hi = rank * half, min((rank + 1) * half, len(self.head_ids))
             self.head_ids = self.head_ids[lo:hi].contiguous()
             sub = self.sub_head
@@ -285,6 +284,15 @@ class DFlash2:
                                     layout=sub.layout, gs=sub.gs, bits=sub.bits)
         if isinstance(target.head, QLinear) and target.head.layout in ("tiled", "volta") and self.sub_rows is None:
             self.sub_head = tile(self.sub_head)
+
+    def own_head(self) -> None:
+        """The draft vocabulary's head rows as this drafter's own copies (an sm_70 head's tile views too:
+        ``VoltaLinear.copy``), so a target head it was given whole can be freed (several ranks: the target keeps its
+        own share)."""
+
+        if self.sub_parts is not None:
+            self.sub_parts = [(Plain(p.weight.clone()) if isinstance(p, Plain) else
+                               p.copy() if hasattr(p, "copy") else p, lo, hi) for p, lo, hi in self.sub_parts]
 
     def _weights(self, fast: bool, bits: int, rank: int, world: int) -> None:
         """Fuse and pack the drafter's projections, then open empty contexts."""
@@ -298,13 +306,13 @@ class DFlash2:
             for layer in range(self.layers):
                 prefix = f"layers.{layer}.self_attn."
                 q, k, v = (self.weights[prefix + n] for n in ("q_proj.weight", "k_proj.weight", "v_proj.weight"))
-                if world == 2:
+                if world > 1:
                     hq, hk = self.heads_local * self.head_dim, self.kv_local * self.head_dim
                     q, k, v = q[rank * hq:(rank + 1) * hq], k[rank * hk:(rank + 1) * hk], v[rank * hk:(rank + 1) * hk]
                     o = self.weights[prefix + "o_proj.weight"]
                     self.weights[prefix + "o_proj.weight"] = o[:, rank * hq:(rank + 1) * hq].contiguous()
                     mlp = f"layers.{layer}.mlp."
-                    inter = self.weights[mlp + "gate_proj.weight"].shape[0] // 2
+                    inter = self.weights[mlp + "gate_proj.weight"].shape[0] // world
                     for n in ("gate_proj.weight", "up_proj.weight"):
                         self.weights[mlp + n] = self.weights[mlp + n][rank * inter:(rank + 1) * inter].contiguous()
                     self.weights[mlp + "down_proj.weight"] = \
@@ -571,16 +579,8 @@ class DFlash2:
             logits = matmul(h, self.sub_head)
         values, local_ids = torch.topk(logits.float(), k=16, dim=-1, sorted=False)
         global_ids = self.head_ids[local_ids]
-        if self.world == 2:
-            import torch.distributed as dist
-
-            both_values = torch.empty((2, *values.shape), dtype=values.dtype, device=values.device)
-            both_ids = torch.empty((2, *global_ids.shape), dtype=global_ids.dtype, device=values.device)
-            dist.all_gather_into_tensor(both_values, values.contiguous())
-            dist.all_gather_into_tensor(both_ids, global_ids.contiguous())
-            merged = torch.cat((both_values[0], both_values[1]), dim=1)
-            values, pick = torch.topk(merged, k=16, dim=-1, sorted=False)
-            global_ids = torch.cat((both_ids[0], both_ids[1]), dim=1).gather(1, pick)
+        if self.world > 1:
+            values, global_ids = self._merge_ranks(values, global_ids)
         shared = [global_ids, torch.cat((values, projected), dim=1), None]     # read back once, by the first finish
         for j, i in enumerate(live):
             out[i] = (shared, j * (length - 1), length - 1, int(pendings[i]))
@@ -626,7 +626,7 @@ class DFlash2:
             g["peer"].before_replay(g["calls"])
         g["graph"].replay()
         values, global_ids, projected = g["out"]
-        if self.world == 2:
+        if self.world > 1:
             values, global_ids = self._merge_ranks(values, global_ids)
         shared = [global_ids, torch.cat((values, projected), dim=1), None]     # read back once, by the first finish
         for j, i in enumerate(live):
@@ -636,13 +636,14 @@ class DFlash2:
     def _merge_ranks(self, values: torch.Tensor, global_ids: torch.Tensor):
         import torch.distributed as dist
 
-        both_values = torch.empty((2, *values.shape), dtype=values.dtype, device=values.device)
-        both_ids = torch.empty((2, *global_ids.shape), dtype=global_ids.dtype, device=values.device)
-        dist.all_gather_into_tensor(both_values, values.contiguous())
-        dist.all_gather_into_tensor(both_ids, global_ids.contiguous())
-        merged = torch.cat((both_values[0], both_values[1]), dim=1)
+        n = self.world                           # every rank's 16 candidates a row, in rank order, then the best 16
+        every_values = torch.empty((n, *values.shape), dtype=values.dtype, device=values.device)
+        every_ids = torch.empty((n, *global_ids.shape), dtype=global_ids.dtype, device=values.device)
+        dist.all_gather_into_tensor(every_values, values.contiguous())
+        dist.all_gather_into_tensor(every_ids, global_ids.contiguous())
+        merged = torch.cat(tuple(every_values), dim=1)
         values, pick = torch.topk(merged, k=16, dim=-1, sorted=False)
-        return values, torch.cat((both_ids[0], both_ids[1]), dim=1).gather(1, pick)
+        return values, torch.cat(tuple(every_ids), dim=1).gather(1, pick)
 
     def _capture_blocks(self, g: dict, S: int, length: int) -> dict:
         import gc
@@ -671,7 +672,7 @@ class DFlash2:
             return values, self.head_ids[local_ids], projected
 
         peer = None
-        if self.world == 2:
+        if self.world > 1:
             from tensorfold.cuda import p2p
 
             peer = p2p.peer()

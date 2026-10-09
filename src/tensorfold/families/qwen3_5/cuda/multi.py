@@ -10,7 +10,7 @@ import torch
 from tensorfold.cuda.capacity import available_bytes
 from tensorfold.cuda.kernels import kvpack
 from tensorfold.cuda.markers import MIN_GAP
-from tensorfold.cuda.memory_gate import MemoryGate, NoRoom, torch_live
+from tensorfold.cuda.memory_gate import RESERVE_MARGIN, MemoryGate, NoRoom, reserve_bytes, torch_live
 from tensorfold.cuda.sampling import sample_streams
 from tensorfold.cuda.streams import PrefixCache, Stream, accept, next_fill
 from tensorfold.engine.grammar import GrammarError, pack
@@ -23,7 +23,7 @@ from .forward import State, _paths, commit, commit_streams, multi_tree_forward, 
 from .prefill import CHUNK, Piece, prefill_batch, prefill_state
 from .weights import Weights
 
-ADMIT, ROUND, DONE, FILL, FILLS = 1, 2, 3, 4, 5   # rank 0's messages
+ADMIT, ROUND, DONE, FILL, FILLS, ROOM, EVICT, GROW = 1, 2, 3, 4, 5, 6, 7, 8   # rank 0's messages
 COPY, TREE, ONE = 0, 1, 2               # a stream's window this round
 STEP = 1024                             # prompt rows a prefill step takes while other streams decode
 TAIL_MERGE = os.environ.get("TENSORFOLD_PREFILL_TAIL_MERGE", "1") != "0"   # a short tail after the last stop: one call
@@ -122,7 +122,7 @@ def _tail(s: Stream, stop: int) -> bool:
 class MultiDecoder:
     """The ``Scheduler``'s decoder on one GPU or as ``rank`` of two; a stream's window holds at most 16 rows."""
 
-    memory_gate: MemoryGate | None = None     # one GPU: streams' caches grow by use (two ranks reserve up front)
+    memory_gate: MemoryGate | None = None     # streams' caches grow by use (every rank, within the fullest one)
     block: int = 16                           # rows of the drafter's next block with several streams (pending, masks)
     depth: bool = True                        # whether the block follows the trees here (DEPTH_CHIPS)
     spent: dict | None = None                 # streams -> the last rounds' ms beside the forward
@@ -161,11 +161,38 @@ class MultiDecoder:
         row = kvpack.row_bytes(hd) if getattr(w, "kv_dtype", "bf16") == "int8" else 2 * hd   # a head's packed row
         self.layer_bytes = 2 * getattr(c, "kv_heads", 0) * row                               # a row of one layer
         self.row_bytes = att * self.layer_bytes
-        self.memory_gate = (MemoryGate(1 << 62, reserve=2 * GIB, live=torch_live(torch, available_bytes))
-                     if world == 1 and cuda else None)
+        self.memory_gate = self.reserve_measured = None
+        if cuda:
+            unified = bool(torch.cuda.get_device_properties(self.device).is_integrated)
+            # a discrete card keeps back what warm() measures above the caches; a unified GPU 2 GiB (shared with the host)
+            reserve, self.reserve_measured = reserve_bytes(0, unified) if world > 1 else (2 * GIB, False)
+            self.local_live = torch_live(torch, available_bytes)
+            # several ranks: rank 0 plans within the fullest rank's free bytes; followers answer its ROOM messages
+            self.memory_gate = MemoryGate(1 << 62, reserve=reserve,
+                                          live=self._fullest if world > 1 else self.local_live)
 
     def live(self) -> int:
         return len(self.streams) + len(self.filling)
+
+    def _fullest(self) -> int:
+        """Rank 0 of several: the least free memory of any rank, each answering a ROOM message."""
+
+        self._send([ROOM])
+        return self._room_gather()
+
+    def _room_gather(self) -> int:
+        import torch.distributed as dist
+
+        mine = torch.tensor([int(self.local_live())], dtype=torch.int64, device=self.device)
+        every = torch.empty((self.world,), dtype=torch.int64, device=self.device)
+        dist.all_gather_into_tensor(every, mine)
+        return int(every.min())
+
+    def _evict(self) -> bool:
+        """Drop a kept prompt end for memory; followers drop the same one (their caches mirror rank 0's)."""
+
+        self._send([EVICT])
+        return self.cache.evict()
 
     def _send(self, values: list[int]) -> None:
         if self.world > 1 and self.broken is None:
@@ -235,21 +262,23 @@ class MultiDecoder:
         if any(x.waiting for x in self.streams.values()):
             raise NoRoom("streams already wait for memory; a new request waits until one finishes")
         while not self.memory_gate.fits(self._first(s) * self.row_bytes):
-            if not self.cache.evict():
+            if not self._evict():
                 if not self.live():
                     return                          # alone: startup fitted one stream's whole window
                 raise NoRoom(f"a {len(s.prompt)}-token prompt waits for memory until a live stream finishes")
             torch.cuda.empty_cache()
 
-    def _grow(self, st: State, have: int, size: int, alone: bool) -> bool:
-        """Grow ``st``'s caches from ``have`` to ``size`` rows while the gate has room (a layer's copy at a time)."""
+    def _grow(self, s: Stream, have: int, size: int, alone: bool) -> bool:
+        """Grow ``s``'s caches from ``have`` to ``size`` rows while the gate has room (a layer's copy at a time)."""
 
+        st = s.st
         while not self.memory_gate.fits((size - have) * self.row_bytes + size * self.layer_bytes):
-            if not self.cache.evict():
+            if not self._evict():
                 if alone:
                     break                           # startup fitted one stream's whole window
                 return False
             torch.cuda.empty_cache()
+        self._send([GROW, s.sid, size])
         reserve(st, size)
         torch.cuda.empty_cache()                    # the old buffers back to the system: MemAvailable stays true
         return True
@@ -266,14 +295,12 @@ class MultiDecoder:
                 s.waiting = False
                 continue
             size = max(rows, min(self._most(s), -(-rows // GROW) * GROW))
-            s.waiting = blocked or not self._grow(s.st, have, size, alone=len(live) == 1 and not self.filling)
+            s.waiting = blocked or not self._grow(s, have, size, alone=len(live) == 1 and not self.filling)
             blocked = blocked or s.waiting
-        if len(live) > 1 and live[0].waiting:          # even the oldest can't grow: the newest ends
+        if len(live) > 1 and live[0].waiting:
+            # even the oldest can't grow: the newest gives way, replayed from its prompt once memory frees
             newest = live[-1]
-            newest.error = RuntimeError(
-                f"This server ran out of memory with {len(live)} streams decoding, so the newest (this request, after "
-                f"{len(newest.out)} tokens) was stopped for the older ones to finish. Retry it, shorten the prompt or "
-                "max_tokens, or start the server with a smaller --parallel.")
+            newest.preempted = True
             newest.done, newest.waiting = True, False
             self.memory_gate.ends += 1
             self.streams.pop(newest.sid, None)
@@ -600,8 +627,15 @@ class MultiDecoder:
 
     @torch.no_grad()
     def calibrate(self, streams: int, reps: int = 3) -> None:
-        """Time the forward at the row counts ``streams`` windows bring; every rank runs the same forwards."""
+        """Time the forward at the row counts ``streams`` windows bring; every rank runs the same forwards. With a
+        measured reserve, a prompt chunk runs too, and the gate keeps back what both allocate above the caches."""
 
+        measure = bool(self.reserve_measured)
+        if measure:
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            base = torch.cuda.memory_allocated()
+            self._warm_prompt()
         st, points = State(self.w), []
         for r in calibration_rows(streams, self.depth):
             n = -(-r // 16)
@@ -617,7 +651,41 @@ class MultiDecoder:
                     times.append(1e3 * (time.perf_counter() - t0))
             points.append((r, sorted(times)[len(times) // 2]))
         self.costs = points
+        if measure:
+            torch.cuda.synchronize()
+            transient = torch.cuda.max_memory_allocated() - base
+            self.memory_gate.reserve = max(self.memory_gate.reserve,
+                                           int(transient) + self._context_scratch(streams) + RESERVE_MARGIN)
         torch.cuda.empty_cache()                      # the widest windows' scratch goes back before any request
+
+    def _warm_prompt(self) -> None:
+        """One full prompt chunk (the drafter tapping it on rank 0) into a state dropped after: its peak is measured."""
+
+        rows = int(getattr(self.w, "prompt_rows", CHUNK))
+        st = private(State(self.w), rows + self.max_rows + 2)
+        drafter = self.draft if self.drafts else None
+        if drafter is not None:
+            drafter.restore(([None] * drafter.layers, [None] * drafter.layers, 0, 0))
+        prefill_state(self.w, [0] * rows, st, tp=self.world > 1, draft=drafter)
+        if drafter is not None:
+            drafter.restore(([None] * drafter.layers, [None] * drafter.layers, 0, 0))
+        del st
+
+    def _context_scratch(self, streams: int) -> int:
+        """What grows with the keys beside the caches, at the full window: the widest round's attention partials and
+        an sm_70 prompt's staged key head (``stream_geometry``'s terms), not reached by warm()'s short contexts."""
+
+        from tensorfold.cuda.build import volta
+
+        c = self.w.config
+        window = self.context or 0
+        rows, heads = 16 * streams, c.heads
+        scratch = rows * heads * (c.head_dim + 2) * -(-window // 512) * 4
+        if volta(self.device):
+            scratch += 2 * window * c.head_dim * 2
+        if getattr(self.w, "kv_dtype", "bf16") == "int8":       # a prompt reads one layer's keys and values unpacked
+            scratch += 2 * window * c.kv_heads * c.head_dim * 2
+        return scratch
 
     def _verify(self, plan, copied=None):
         """Both ranks: drafter blocks, rank 0's windows, the forward and each stream's samples."""
@@ -841,3 +909,11 @@ class MultiDecoder:
             elif msg[0] == DONE:
                 for sid in msg[2:2 + msg[1]]:
                     self._finish(sid)
+            elif msg[0] == ROOM:
+                self._room_gather()
+            elif msg[0] == EVICT:
+                self.cache.evict()
+                torch.cuda.empty_cache()
+            elif msg[0] == GROW:
+                reserve(self.streams[msg[1]].st, msg[2])
+                torch.cuda.empty_cache()

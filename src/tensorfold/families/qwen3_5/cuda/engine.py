@@ -85,7 +85,11 @@ class Qwen27Engine:
 
             from .distributed import split_weights
 
-            dist.init_process_group("nccl", init_method=f"tcp://{master}:{port}", rank=rank, world_size=tp)
+            from datetime import timedelta
+
+            # followers wait in a broadcast for rank 0s next request: an idle server must outlast NCCLs 10 min default
+            dist.init_process_group("nccl", init_method=f"tcp://{master}:{port}", rank=rank, world_size=tp,
+                                    timeout=timedelta(days=365))
             # both ranks must run the same calls: refuse to start when they were given different settings
             flags = torch.tensor([int(draft_dir is not None and tp_draft), max_rows, int(split_head), int(allow_copy),
                                   streams, -1 if context is None else int(context), int(bool(context_explicit)),

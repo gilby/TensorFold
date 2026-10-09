@@ -326,6 +326,9 @@ def gather_rank_partials(local: torch.Tensor, group=None,
     if peer is not None and group is None and local.is_cuda and peer.fits(local):
         if peer.small(local):
             return peer(local, dtype)           # one launch over the peer mapping: the same bits as below
+        if (local.dtype == dtype and hasattr(peer, "reduce")
+                and os.environ.get("TF_TP_REDUCE_SCATTER", "1") != "0"):
+            return peer.reduce(local)           # a reduce-scatter and an all-gather through host memory: the same bits
         parts = peer.gather(local)              # copies through shared host memory, then the rank-ordered sum
         acc = parts[0].float()
         for r in range(1, world):

@@ -132,6 +132,7 @@ class MultiDecoder:
     held: tuple = ()                          # those buffers' addresses when it moved in (a regrowth drops graphs)
     trees = None                              # TreeGraphs: a lone tree-drafting stream's verify and commit as graphs
     tree_home = None                          # the stream whose GDN states are ``trees``' buffers
+    together = None                           # RoundGraphs: several streams' tree verify as graphs (several ranks)
 
     def __init__(self, w: Weights, draft=None, *, max_rows: int = 16, allow_copy: bool = True, stop_eos: bool = True,
                  keep: int = 8, rank: int = 0, world: int = 1, context: int = 0, points=None, vision=None) -> None:
@@ -637,15 +638,18 @@ class MultiDecoder:
             base = torch.cuda.memory_allocated()
             self._warm_prompt()
         st, points = State(self.w), []
+        graphs = self.together
         for r in calibration_rows(streams, self.depth):
-            n = -(-r // 16)
+            # with round graphs, the rows over two streams where they can be (as a round of several replays them)
+            n = max(-(-r // 16), 2 if graphs is not None and r > 1 else 1)
             sizes = [r // n + (i < r % n) for i in range(n)]
             wins = [([0] * k, list(range(-1, k - 1)), st) for k in sizes]
             times = []
             for i in range(reps + 1):
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
-                multi_tree_forward(self.w, wins, full_logits=self.split or self.rank == 0, tp=self.world > 1)
+                if graphs is None or graphs.forward(wins) is None:
+                    multi_tree_forward(self.w, wins, full_logits=self.split or self.rank == 0, tp=self.world > 1)
                 torch.cuda.synchronize()
                 if i:
                     times.append(1e3 * (time.perf_counter() - t0))
@@ -721,9 +725,14 @@ class MultiDecoder:
         elif self._together(plan, taps_wanted):       # several: one graph, each window padded to the same rows
             logits, rows, record, taps, starts = self.trees.verify_streams(wins, states)
         else:
-            logits, record, taps, starts = multi_tree_forward(
-                self.w, [(t, p, st) for (t, p), st in zip(wins, states)],
-                full_logits=self.split or self.rank == 0, tp=self.world > 1, capture_taps=taps_wanted)
+            streams = [(t, p, st) for (t, p), st in zip(wins, states)]
+            out = self.together.forward(streams) if self._rounds(plan, taps_wanted) else None
+            if out is not None:                       # the eager forward's rows, first in a graph's padded width
+                logits, record, taps, starts = out
+            else:
+                logits, record, taps, starts = multi_tree_forward(
+                    self.w, streams, full_logits=self.split or self.rank == 0, tp=self.world > 1,
+                    capture_taps=taps_wanted)
             rows = starts                             # logits rows by stream (``starts``: record and taps rows)
         t0 = _mark("verify", t0)
         for k, window in grammars.items():          # a constrained stream's rows, each masked by its path
@@ -760,15 +769,26 @@ class MultiDecoder:
         return s
 
     def _graphed(self, streams: int) -> bool:
-        """Whether a round of this many streams replays graphs (several need ``MultiGraphs``)."""
+        """Whether a round of this many streams replays graphs (several need ``MultiGraphs`` or ``RoundGraphs``)."""
 
-        return self.trees is not None and (streams == 1 or hasattr(self.trees, "verify_streams"))
+        return self.trees is not None and (streams == 1 or hasattr(self.trees, "verify_streams")
+                                           or self.together is not None)
+
+    def _rounds(self, plan, taps_wanted: bool) -> bool:
+        """Whether several streams may verify from ``together`` (every rank decides alike from mirrored fields)."""
+
+        g = self.together
+        if g is None or len(plan) < 2 or (taps_wanted and not g.taps):
+            return False
+        if g.full_logits != (self.split or self.rank == 0):
+            return False
+        return all(self.streams[sid].constraint is None and self.streams[sid].vision is None for sid, *_ in plan)
 
     def _together(self, plan, taps_wanted: bool) -> bool:
         """Whether several streams verify from ``trees``' multi-stream graph (both ranks decide alike)."""
 
         g = self.trees
-        if len(plan) < 2 or not self._graphed(len(plan)) or (taps_wanted and not g.taps):
+        if len(plan) < 2 or not hasattr(g, "verify_streams") or (taps_wanted and not g.taps):
             return False
         if g.full_logits != (self.split or self.rank == 0):
             return False

@@ -337,9 +337,9 @@ class Qwen27Engine:
             raise ValueError(f"no adapter {adapter!r} on this engine (TF_ADAPTERS)")
         from .decisions import Decision
 
-        if vision is not None:
-            raise ValueError("image decisions need an engine started with --vision")
-        return self.scheduler.decide(Decision(prompt, adapter, on_hidden))
+        d = Decision(prompt, adapter, on_hidden)
+        d.vision = vision
+        return self.scheduler.decide(d)
 
     def close(self) -> None:
         """Stop the concurrent scheduler's worker, so the engine's GPU memory can go (tests start several engines)."""

@@ -882,6 +882,10 @@ class MultiDecoder:
             raise ValueError(f"no adapter {d.adapter!r} on this engine (TF_ADAPTERS)")
         if self.context and len(d.prompt) > self.context:
             raise ValueError(f"a {len(d.prompt)}-token decision exceeds the {self.context}-token context")
+        if d.vision is not None:
+            if self.vision is None or self.world > 1:
+                raise ValueError("image decisions require starting this engine with --vision (one GPU)")
+            d.vision = self.vision.encode(d.vision, d.prompt)
         if self.memory_gate is not None:
             while not self.memory_gate.fits(len(d.prompt) * self.row_bytes):
                 if not self._evict():
@@ -900,13 +904,13 @@ class MultiDecoder:
         self.deciding.append(d)
 
     def _decide(self) -> list:
-        """A prefill step for decisions: whole short ones in one forward, else the oldest STEP rows (or a forward's)
-        further while streams decode; returns the decisions that finished, every row's final state on rank 0."""
+        """A prefill step for decisions: whole short text ones in one forward, else the oldest STEP rows (or a
+        forward's) further while streams decode; returns the decisions that finished, every row's final state."""
 
         room = STEP if any(not x.done for x in self.streams.values()) else getattr(self.w, "prompt_rows", CHUNK)
         batch, left = [], room
         for d in (self.deciding if DECISION_BATCH else ()):
-            if d.st.pos or len(d.prompt) > left:
+            if d.st.pos or d.vision is not None or len(d.prompt) > left:
                 break
             batch.append(d)
             left -= len(d.prompt)
@@ -916,7 +920,8 @@ class MultiDecoder:
                 self._dsteps(batch)
             else:
                 d = self.deciding[0]
-                stop = min(len(d.prompt), d.st.pos + room)
+                # an image decision prefills whole (its rope offset is set by its first step)
+                stop = len(d.prompt) if d.vision is not None else min(len(d.prompt), d.st.pos + room)
                 self._send([DSTEP, d.sid, stop])
                 self._dstep(d, stop)
         except Exception as exc:                 # noqa: BLE001  (one GPU: these decisions fail, the others go on)
@@ -958,7 +963,7 @@ class MultiDecoder:
         before, prefill_attention.MODE = prefill_attention.MODE, DECISION_ATTN or None
         try:
             with adapters.applied(self.adapters[d.adapter]):
-                rows = prefill_state(self.w, d.prompt[:stop], d.st, tp=self.world > 1, every=True)
+                rows = prefill_state(self.w, d.prompt[:stop], d.st, tp=self.world > 1, every=True, vision=d.vision)
         except Exception as exc:
             if self.world > 1:
                 self.broken = exc

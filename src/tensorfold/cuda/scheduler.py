@@ -112,6 +112,16 @@ class Scheduler:
             else:
                 return value
 
+    def decide(self, decision: Any) -> dict:
+        """Prefill a decision prompt (``families.qwen3_5.cuda.decisions``) in turn with the streams; its stats."""
+
+        box: queue.Queue = queue.Queue()
+        self.waiting.put((decision, box))
+        kind, value = box.get()
+        if kind == "error":
+            raise value
+        return value
+
     def submit_many(self, requests: list[dict]) -> list[dict]:
         """Queue isolated one-shot requests atomically and return ordered stats, draining errors too."""
 

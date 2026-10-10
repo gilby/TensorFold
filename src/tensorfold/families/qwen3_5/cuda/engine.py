@@ -176,6 +176,16 @@ class Qwen27Engine:
         if self.kv_dtype != "bf16" and rank == 0:
             print(f"[tensorfold] {self.kv_dtype} KV cache (fp16 scale per 32 values): "
                   f"{self.context_window} tokens a window", flush=True)
+        # runtime adapters (decisions only: TF_ADAPTERS), each rank its shard of every adapted projection
+        from . import adapters as lora
+        from .decisions import configured
+
+        self.adapters = {}
+        for name, where in configured().items():
+            self.adapters[name] = lora.load(where, self.w, rank=rank, world=tp, name=name)
+            if rank == 0:
+                print(f"[tensorfold] adapter {name}: {len(self.adapters[name].mods)} projections, "
+                      f"{self.adapters[name].nbytes() / 2**30:.2f} GiB on this rank (decisions only)", flush=True)
         self.draft = None
         if draft_dir is not None and (rank == 0 or (tp > 1 and tp_draft)):
             from .dflash1 import drafter_class
@@ -238,6 +248,7 @@ class Qwen27Engine:
                                       context=self.capacity_plan["cache_slots"], keep=keep, points=self.points,
                                       vision=self.vision)
             self.multi.model_dir = self.model_dir             # rank 1 compiles a request's grammar from it
+            self.multi.adapters = self.adapters
             if (self.draft is not None and hasattr(self.draft, "graph_chain") and tp == 1
                     and os.environ.get("TF_DRAFT_GRAPHS", "1") != "0"):
                 from .chain_graphs import ChainGraphs
@@ -316,6 +327,19 @@ class Qwen27Engine:
         from tensorfold.cuda.markers import MIN_GAP
 
         return not (stops and len(prompt) - stops[-1] < MIN_GAP)
+
+    def decide(self, prompt: list[int], adapter: str, vision=None, on_hidden=None) -> dict:
+        """A decision prompt with ``adapter`` on: every row's final normed state (rank 0), no token sampled."""
+
+        if self.scheduler is None:
+            raise ValueError("decisions run on the concurrent scheduler: start with --parallel 2 or more")
+        if adapter not in self.adapters:
+            raise ValueError(f"no adapter {adapter!r} on this engine (TF_ADAPTERS)")
+        from .decisions import Decision
+
+        if vision is not None:
+            raise ValueError("image decisions need an engine started with --vision")
+        return self.scheduler.decide(Decision(prompt, adapter, on_hidden))
 
     def close(self) -> None:
         """Stop the concurrent scheduler's worker, so the engine's GPU memory can go (tests start several engines)."""

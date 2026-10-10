@@ -15,7 +15,7 @@ from tensorfold.cuda.kernels import kvpack
 from tensorfold.cuda.kernels import qmm as shared
 from tensorfold.cuda.kernels.prefill_attention import attention
 
-from . import glue
+from . import adapters, glue
 from . import prefill_bf16, prefill_glue
 from .decode import clone_state
 from .forward import State, grow as _grow
@@ -31,8 +31,15 @@ TAP_LAYERS = (5, 19, 33, 47, 61)          # Qwen3.8-27B's (Weights.tap_layers)
 
 
 def _mm(x, w: QLinear, f32: bool = False) -> torch.Tensor:
-    """``x``: bf16 rows (``prefill_bf16``), or e4m3 rows with group sums and row scales (``prefill_glue``, FP8)."""
+    """``x``: bf16 rows (``prefill_bf16``), or e4m3 rows with group sums and row scales (``prefill_glue``, FP8); an
+    applied adapter (``adapters.applied``, decision prefills only) adds its term to the projections it adapts."""
 
+    y = _mm_base(x, w, f32)
+    a = adapters.ACTIVE
+    return y if a is None else a.add(x, w, y)
+
+
+def _mm_base(x, w: QLinear, f32: bool = False) -> torch.Tensor:
     if isinstance(x, tuple):
         return shared.prefill_matmul8(x, tile(w), f32=f32) if isinstance(w, QLinear) else w.prefill8(x)
     if not isinstance(w, QLinear):
@@ -63,6 +70,9 @@ def _mm_group(x, ws: list) -> list[torch.Tensor]:
         from .b16 import prompt_pair
 
         got.update(zip(plain, prompt_pair(x, ws[plain[0]].weight, ws[plain[1]].weight)))
+    a = adapters.ACTIVE
+    if a is not None:                                      # the grouped products bypass _mm: their terms here
+        got = {i: a.add(x, ws[i], y) for i, y in got.items()}
     return [got[i] if i in got else _mm(x, w) for i, w in enumerate(ws)]
 
 
@@ -72,7 +82,8 @@ FUSED_MLP = True           # checkpoint-math NVFP4 MLPs: SwiGLU inside the gate|
 def _mlp(h, layer, pg, tp: bool) -> torch.Tensor:
     """A dense layer's MLP over prompt rows; checkpoint-math NVFP4 layers take the fused gate|up epilogue."""
 
-    if FUSED_MLP and not tp and torch.is_tensor(h) and getattr(layer.down, "act", None) is not None:
+    if (FUSED_MLP and not tp and torch.is_tensor(h) and getattr(layer.down, "act", None) is not None
+            and adapters.ACTIVE is None):                  # an adapter's terms go between the products
         from tensorfold.cuda.nvfp4 import checkpoint
 
         y = checkpoint.mlp_prompt(h, layer.gate, layer.up, layer.down)
@@ -208,8 +219,11 @@ def chunks(start: int, end: int, size: int = CHUNK) -> list[tuple[int, int]]:
 
 @torch.no_grad()
 def prefill_state(w: Weights, prompt: Sequence[int], st: State, *, tp: bool = False, draft=None,
-                  size: int | None = None, keep_at: int | None = None, vision=None):
-    """Commit prompt[st.pos:] into ``st``, tapping the drafter's window; ``keep_at``: ``(normed, (state, snapshot))``, the state after prompt[:keep_at] from a cut chunk."""
+                  size: int | None = None, keep_at: int | None = None, vision=None, every: bool = False):
+    """Commit prompt[st.pos:] into ``st``, tapping the drafter's window; ``keep_at``: ``(normed, (state, snapshot))``, the state after prompt[:keep_at] from a cut chunk; ``every``: every new row's final normed state (a decision's head reads them all), not just the last."""
+
+    if every and (keep_at is not None or draft is not None):
+        raise ValueError("every row's states are for a decision prefill: no kept state, no drafter")
 
     dev = w.norm.device
     base, n = st.pos, len(prompt)
@@ -235,9 +249,11 @@ def prefill_state(w: Weights, prompt: Sequence[int], st: State, *, tp: bool = Fa
             kept = (clone_state(st), draft.snapshot() if draft is not None else None)
         wants = [draft is not None and b > tap_from for _, b in spans]
         cuts = [keep_at - a if keep_at is not None and a < keep_at < b else 0 for a, b in spans]
-        groups = [_Rows(w, [(prompt[a:b], st, a, cut)], tp=tp, capture_taps=want)
+        groups = [_Rows(w, [(prompt[a:b], st, a, cut)], tp=tp, capture_taps=want, every=every)
                   for (a, b), cut, want in zip(spans, cuts, wants)]
+        every_rows = []
         for (a, b), cut, want, [(normed, taps, part)] in zip(spans, cuts, wants, _layer_major(w, groups)):
+            every_rows.append(normed)
             snap = None
             if want:                               # the drafter takes the taps in chunk order, as chunk by chunk
                 rows = taps[max(0, tap_from - a):]
@@ -249,18 +265,23 @@ def prefill_state(w: Weights, prompt: Sequence[int], st: State, *, tp: bool = Fa
                 draft.add_taps(rows)
             if part is not None:
                 kept = (part, snap)
+        if every:
+            return torch.cat(every_rows)
         if keep_at is None:
             return normed
         if keep_at == n:
             kept = (clone_state(st), draft.snapshot() if draft is not None else None)
         return normed, kept
+    every_rows = []
     for j, (a, b) in enumerate(spans):
         if keep_at == a:
             kept = (clone_state(st), draft.snapshot() if draft is not None else None)
         cut = keep_at - a if keep_at is not None and a < keep_at < b else 0
         want = draft is not None and b > tap_from
         normed, taps, *part = prefill_chunk(w, ids[a - base:b - base], st, tp=tp, capture_taps=want,
-                                            last=j == len(spans) - 1, cut=cut, vision=vision)
+                                            last=j == len(spans) - 1, every=every, cut=cut, vision=vision)
+        if every:
+            every_rows.append(normed)
         snap = None
         if want:
             rows = taps[max(0, tap_from - a):]
@@ -272,6 +293,8 @@ def prefill_state(w: Weights, prompt: Sequence[int], st: State, *, tp: bool = Fa
             draft.add_taps(rows)
         if part:
             kept = (part[0], snap)
+    if every:
+        return torch.cat(every_rows) if len(every_rows) > 1 else every_rows[0]
     if keep_at is None:
         return normed
     if keep_at == n:
@@ -301,8 +324,9 @@ class _Rows:
     (ids, state, first position, cut). Layer-major prefill keeps several of these (a prompt's chunks) and runs layer l
     of each in turn before layer l + 1; a chunk's state is its stream's, advanced by the chunks before it."""
 
-    def __init__(self, w: Weights, items, *, tp: bool = False, capture_taps: bool = False) -> None:
+    def __init__(self, w: Weights, items, *, tp: bool = False, capture_taps: bool = False, every: bool = False) -> None:
         c = w.config
+        self.every = every                          # each row's final normed state (decisions), not just the last
         if any(layer.moe is not None for layer in w.layers):
             raise ValueError("a batched prefill takes dense layers only")
         self.w, self.tp, self.capture_taps = w, tp, capture_taps
@@ -392,26 +416,27 @@ class _Rows:
 
     def finish(self) -> list[tuple[torch.Tensor, torch.Tensor | None, State | None]]:
         c, x, pending = self.w.config, self.x, self.pending
-        every = torch.cat(self.taps, dim=-1) if self.capture_taps else None
+        tapped = torch.cat(self.taps, dim=-1) if self.capture_taps else None
         out = []
         for st, part, p0, (_, _, _, cut), (o, n) in zip(self.sts, self.parts, self.p0s, self.items, self.spans):
             st.pos = p0 + n
-            _, normed, _ = glue.add_rmsnorm(x[o + n - 1:o + n].contiguous(), pending[o + n - 1:o + n].contiguous(),
-                                            self.w.norm, c.eps)
+            lo = o if self.every else o + n - 1
+            _, normed, _ = glue.add_rmsnorm(x[lo:o + n].contiguous(), pending[lo:o + n].contiguous(), self.w.norm, c.eps)
             if part is not None:
                 part.pos = p0 + cut                 # the piece's buffers: their rows below part.pos stay as committed
-            out.append((normed, None if every is None else every[o:o + n], part))
+            out.append((normed, None if tapped is None else tapped[o:o + n], part))
         return out
 
 
 @torch.no_grad()
 def prefill_rows(w: Weights, items: list[tuple[Sequence[int], State, int]], *, tp: bool = False,
-                 capture_taps: bool = False) -> list[tuple[torch.Tensor, torch.Tensor | None, State | None]]:
+                 capture_taps: bool = False, every: bool = False) -> list[tuple[torch.Tensor, torch.Tensor | None, State | None]]:
     """``prefill_chunk`` for several streams in one forward (dense text layers): ``items`` are (ids, state, cut).
     Projections, norms and MLPs run over every row at once, each row's bits its own; each stream's convolution
     windows, DeltaNet chains and attention read its own state. Per item: (last row normed, taps, the state at cut)."""
 
-    rows = _Rows(w, [(ids, st, st.pos, cut) for ids, st, cut in items], tp=tp, capture_taps=capture_taps)
+    rows = _Rows(w, [(ids, st, st.pos, cut) for ids, st, cut in items], tp=tp, capture_taps=capture_taps,
+                 every=every)
     for i, layer in enumerate(w.layers):
         rows.layer(i, layer)
     return rows.finish()
@@ -434,7 +459,7 @@ def _layer_major(w: Weights, groups: list[_Rows]) -> list[list[tuple]]:
 
 
 @torch.no_grad()
-def prefill_batch(w: Weights, pieces: list[Piece], *, tp: bool = False, draft=None) -> list[tuple]:
+def prefill_batch(w: Weights, pieces: list[Piece], *, tp: bool = False, draft=None, every: bool = False) -> list[tuple]:
     """``prefill_state`` for several streams in one forward (``prefill_rows``): every result has the bits
     ``prefill_state`` gives its piece alone. Per piece: (the last row's normed state, ``(state, snapshot)`` at
     ``keep_at`` or None, the drafter's context after or None). The caller keeps the rows within one forward's."""
@@ -455,7 +480,7 @@ def prefill_batch(w: Weights, pieces: list[Piece], *, tp: bool = False, draft=No
             kept = (clone_state(p.st), (list(p.snap[0]), list(p.snap[1]), p.snap[2], p.snap[3]) if drafting else None)
         plans.append((base, n, drafting, tap_from, cut, kept))
     outs = prefill_rows(w, [(p.prompt[base:], p.st, cut) for p, (base, _, _, _, cut, _) in zip(pieces, plans)],
-                        tp=tp, capture_taps=any(plan[2] for plan in plans))
+                        tp=tp, capture_taps=any(plan[2] for plan in plans), every=every)
     results = []
     for p, (base, n, drafting, tap_from, cut, kept), (normed, taps, part) in zip(pieces, plans, outs):
         snap = at_cut = None

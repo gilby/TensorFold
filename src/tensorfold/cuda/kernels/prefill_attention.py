@@ -155,6 +155,9 @@ def volta_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tenso
 KEY_BLOCK = 2048          # keys a block: absolute [j * KEY_BLOCK, (j + 1) * KEY_BLOCK), always whole (zeros past the keys)
 
 
+MODE = None              # a caller's mode for the prompts it runs now (decisions take fp32 scores), else TF_PROMPT_ATTN
+
+
 def prompt_mode() -> str:
     """``TF_PROMPT_ATTN`` on sm_70: ``blocked16`` (the default: cuBLASLt GEMMs over absolute key blocks, the scores
     scaled and rounded to fp16 in the GEMM's epilogue), ``blocked`` (fp32 scores), ``fused`` (one causal mma.m8n8k4
@@ -162,7 +165,7 @@ def prompt_mode() -> str:
 
     import os
 
-    return os.environ.get("TF_PROMPT_ATTN", "blocked16")
+    return MODE or os.environ.get("TF_PROMPT_ATTN", "blocked16")
 
 
 def prompt_v4() -> bool:

@@ -30,8 +30,37 @@ def metal() -> bool:
     return mx.metal.is_available() and mx.default_device() == mx.gpu
 
 
+_HEAD_QUERIES = r"""
+    const uint row = thread_position_in_grid.x / KL;
+    if (row >= N) return;
+    const uint lane = thread_index_in_simdgroup % KL;
+    float sums[Q];
+    for (uint q = 0; q < Q; ++q) sums[q] = 0;
+    for (uint k = lane * 4; k < K; k += KL * 4) {
+        const size_t offset = size_t(row) * K + k;
+        const float4 a = float4(w[offset], w[offset + 1], w[offset + 2], w[offset + 3]);
+        for (uint q = 0; q < Q; ++q) {
+            const float4 b = float4(x[q * K + k], x[q * K + k + 1], x[q * K + k + 2], x[q * K + k + 3]);
+            sums[q] += dot(a, b);
+        }
+    }
+    for (uint q = 0; q < Q; ++q) {
+        float sum = sums[q];
+        for (uint offset = KL / 2; offset > 0; offset /= 2) {
+            sum += simd_shuffle_down(sum, offset);
+        }
+        if (lane == 0) y[q * N + row] = sum;
+    }
+"""
+# queries a head launch reads the weights once for (each query's sum in the one-query kernel's order)
+HEAD_QUERIES = 32
+
+
 @cache
-def _head_kernel() -> Any:
+def _head_kernel(queries: int = 0) -> Any:
+    if queries:
+        return mx.fast.metal_kernel(name="tf_dsv41_bf16_head_fp32_queries", input_names=["x", "w"],
+                                    output_names=["y"], source=_HEAD_QUERIES)
     return mx.fast.metal_kernel(name="tf_dsv41_bf16_head_fp32", input_names=["x", "w"], output_names=["y"],
                                 source=_HEAD)
 
@@ -42,15 +71,24 @@ def head_fits(weight: mx.array) -> bool:
 
 
 def head_logits(x: mx.array, weight: mx.array, rows_exact: bool) -> mx.array:
-    """x [R, K] through the bf16 head [V, K]: fp32 logits [R, V]."""
+    """x [R, K] through the bf16 head [V, K]: fp32 logits [R, V]; up to 32 rows share one read of the head."""
 
     rows, width = weight.shape
     if head_fits(weight):
-        lanes = 16
-        return _head_kernel()(inputs=[mx.contiguous(x.astype(mx.float32)), weight],
-                              template=[("N", rows), ("K", width), ("KL", lanes)],
-                              grid=(((rows * lanes + 63) // 64) * 64, int(x.shape[0]), 1), threadgroup=(64, 1, 1),
-                              output_shapes=[(int(x.shape[0]), rows)], output_dtypes=[mx.float32])[0]
+        lanes, queries = 16, int(x.shape[0])
+        x = mx.contiguous(x.astype(mx.float32))
+        if queries == 1:
+            return _head_kernel()(inputs=[x, weight], template=[("N", rows), ("K", width), ("KL", lanes)],
+                                  grid=(((rows * lanes + 63) // 64) * 64, 1, 1), threadgroup=(64, 1, 1),
+                                  output_shapes=[(1, rows)], output_dtypes=[mx.float32])[0]
+        outs = []
+        for q0 in range(0, queries, HEAD_QUERIES):
+            q = min(HEAD_QUERIES, queries - q0)
+            outs.append(_head_kernel(1)(inputs=[x[q0:q0 + q], weight],
+                                        template=[("N", rows), ("K", width), ("KL", lanes), ("Q", q)],
+                                        grid=(((rows * lanes + 63) // 64) * 64, 1, 1), threadgroup=(64, 1, 1),
+                                        output_shapes=[(q, rows)], output_dtypes=[mx.float32])[0])
+        return mx.concatenate(outs) if len(outs) > 1 else outs[0]
     w = weight.astype(mx.float32)
     if not rows_exact or int(x.shape[0]) == 1:
         return x.astype(mx.float32) @ w.T
@@ -146,6 +184,8 @@ def hc_pre_norm(x: mx.array, pre: mx.array, weight: mx.array, eps: float) -> mx.
                                       template=[("T", x.dtype), ("D", dims)], grid=(rows * 256, 1, 1),
                                       threadgroup=(256, 1, 1), output_shapes=[(rows, dims)],
                                       output_dtypes=[x.dtype])[0]
+    if rows_mode() and rows > 1:                  # MLX's CPU sum can round a row differently beside other rows
+        return mx.concatenate([hc_pre_norm(x[r:r + 1], pre[r:r + 1], weight, eps) for r in range(rows)])
     xf = x.astype(mx.float32)
     v = xf[:, 0] * pre[:, 0:1]
     for i in range(1, 4):
@@ -232,6 +272,78 @@ _ATTN_FUSED = r"""
     if (lane == 0) { partial[out_base + D] = maximum; partial[out_base + D + 1] = denominator; }
 """
 
+# the fused kernel for HG heads a thread group: each key row read once for the group, every head's sums unchanged
+_ATTN_FUSED_HEADS = r"""
+    const uint lane = thread_index_in_simdgroup, block = simdgroup_index_in_threadgroup;
+    const uint head0 = threadgroup_position_in_grid.x * HG, query = threadgroup_position_in_grid.y;
+    const int H = meta[0], W = meta[1], C = meta[2], NW = meta[3], NC = meta[4];
+    threadgroup float scores[HG][NB * CHUNK], maxima[HG][NB], probabilities[HG][NB * CHUNK];
+    float qv[HG][D / 32];
+    for (int g = 0; g < HG; ++g)
+        for (int v = 0; v < D / 32; ++v) qv[g][v] = float(q[(query * H + head0 + g) * D + lane * (D / 32) + v]);
+    float maximum[HG];
+    for (int g = 0; g < HG; ++g) maximum[g] = -1e30f;
+    const int first = lane * (D / 32);
+    for (int j = 0; j < CHUNK; ++j) {
+        const int slot = int(block) * CHUNK + j;
+        const bool compressed = slot >= W;
+        const int row = slot >= W + C ? -1 : compressed ? ci[query * C + slot - W] : wi[query * W + slot];
+        const bool ok = row >= 0 && row < (compressed ? NC : NW);
+        float kv[D / 32];
+        if (ok)
+            for (int v = 0; v < D / 32; ++v)
+                kv[v] = compressed ? float(pooled[size_t(row) * D + first + v]) : float(window[size_t(row) * D + first + v]);
+        for (int g = 0; g < HG; ++g) {
+            float score = -INFINITY;
+            if (ok) {
+                float dot = 0.0f;
+                for (int v = 0; v < D / 32; ++v) dot = fma(qv[g][v], kv[v], dot);
+                score = simd_sum(dot) * scalep[0];
+            }
+            maximum[g] = max(maximum[g], score);
+            if (lane == 0) scores[g][block * CHUNK + j] = score;
+        }
+    }
+    if (lane == 0) for (int g = 0; g < HG; ++g) maxima[g][block] = maximum[g];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float denominator[HG];
+    for (int g = 0; g < HG; ++g) {
+        float m = -1e30f;
+        for (uint b = lane; b <= min(block | uint(64 / CHUNK - 1), uint(NB - 1)); b += 32) m = max(m, maxima[g][b]);
+        m = simd_max(m);
+        maximum[g] = m;
+        float d = 0.0f;
+        for (uint j = lane; j < CHUNK; j += 32) {
+            const float p = exp(scores[g][block * CHUNK + j] - m);
+            d += p;
+            probabilities[g][block * CHUNK + j] = float(bfloat16_t(p));
+        }
+        denominator[g] = simd_sum(d);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    float acc[HG][D / 32];
+    for (int g = 0; g < HG; ++g)
+        for (int v = 0; v < D / 32; ++v) acc[g][v] = 0.0f;
+    for (int j = 0; j < CHUNK; ++j) {
+        const int slot = int(block) * CHUNK + j;
+        const bool compressed = slot >= W;
+        const int row = slot >= W + C ? -1 : compressed ? ci[query * C + slot - W] : wi[query * W + slot];
+        if (row < 0 || row >= (compressed ? NC : NW)) continue;
+        float kv[D / 32];
+        for (int v = 0; v < D / 32; ++v)
+            kv[v] = compressed ? float(pooled[size_t(row) * D + first + v]) : float(window[size_t(row) * D + first + v]);
+        for (int g = 0; g < HG; ++g) {
+            const float p = probabilities[g][block * CHUNK + j];
+            for (int v = 0; v < D / 32; ++v) acc[g][v] = fma(p, kv[v], acc[g][v]);
+        }
+    }
+    for (int g = 0; g < HG; ++g) {
+        const size_t out_base = ((size_t(query) * H + head0 + g) * NB + block) * (D + 2);
+        for (int v = 0; v < D / 32; ++v) partial[out_base + lane * (D / 32) + v] = acc[g][v];
+        if (lane == 0) { partial[out_base + D] = maximum[g]; partial[out_base + D + 1] = denominator[g]; }
+    }
+"""
+
 _ATTN_MERGE = r"""
     const uint lane = thread_index_in_simdgroup;
     const uint part = threadgroup_position_in_grid.x * 4 + simdgroup_index_in_threadgroup;
@@ -256,12 +368,19 @@ _ATTN_MERGE = r"""
 
 @cache
 def _attn_kernel(stage: str) -> Any:
-    if stage == "fused":
-        return mx.fast.metal_kernel(name="tf_dsv41_attn_fused",
+    if stage in ("fused", "heads"):
+        return mx.fast.metal_kernel(name="tf_dsv41_attn_fused" + ("_heads" if stage == "heads" else ""),
                                     input_names=["q", "window", "pooled", "wi", "ci", "meta", "scalep"],
-                                    output_names=["partial"], source=_ATTN_FUSED)
+                                    output_names=["partial"], source=_ATTN_FUSED if stage == "fused" else
+                                    _ATTN_FUSED_HEADS)
     return mx.fast.metal_kernel(name="tf_dsv41_attn_merge", input_names=["partial", "sink", "meta"],
                                 output_names=["out"], source=_ATTN_MERGE)
+
+
+import os as _os
+
+# heads a thread group of the fused attention kernel takes (each key row read once for them; 1: a head each)
+ATTN_HEAD_GROUP = int(_os.environ.get("TF_DSV41_ATTN_HEADS", "2"))
 
 
 def attention_fits(slots: int, dims: int) -> bool:
@@ -280,14 +399,23 @@ def attention(q: mx.array, window: mx.array, pooled: mx.array | None, wi: mx.arr
     if pooled is None or not int(pooled.size):
         pooled = mx.zeros((1, dim), dtype=mx.bfloat16)
     meta = mx.array([heads, W, C, int(window.shape[0]), int(pooled.shape[0])], dtype=mx.int32)
-    partial = _attn_kernel("fused")(
-        inputs=[mx.contiguous(q), mx.contiguous(window.astype(mx.float32)), mx.contiguous(pooled),
-                mx.contiguous(wi.astype(mx.int32)) if W else mx.zeros((1,), mx.int32),
-                mx.contiguous(ci.astype(mx.int32)) if C else mx.zeros((1,), mx.int32), meta,
-                mx.array([scale], dtype=mx.float32)],
-        template=[("D", dim), ("NB", blocks), ("CHUNK", chunk)], grid=(heads * blocks * 32, length, 1),
-        threadgroup=(blocks * 32, 1, 1), output_shapes=[(length, heads, blocks, dim + 2)],
-        output_dtypes=[mx.float32])[0]
+    group = ATTN_HEAD_GROUP if heads % ATTN_HEAD_GROUP == 0 and length > 1 else 1      # same bits either way
+    while group > 1 and group * (2 * blocks * chunk + blocks) * 4 > 32768:       # its scores fit thread group memory
+        group //= 2
+    inputs = [mx.contiguous(q), mx.contiguous(window.astype(mx.float32)), mx.contiguous(pooled),
+              mx.contiguous(wi.astype(mx.int32)) if W else mx.zeros((1,), mx.int32),
+              mx.contiguous(ci.astype(mx.int32)) if C else mx.zeros((1,), mx.int32), meta,
+              mx.array([scale], dtype=mx.float32)]
+    if group > 1:
+        partial = _attn_kernel("heads")(
+            inputs=inputs, template=[("D", dim), ("NB", blocks), ("CHUNK", chunk), ("HG", group)],
+            grid=(heads // group * blocks * 32, length, 1), threadgroup=(blocks * 32, 1, 1),
+            output_shapes=[(length, heads, blocks, dim + 2)], output_dtypes=[mx.float32])[0]
+    else:
+        partial = _attn_kernel("fused")(
+            inputs=inputs, template=[("D", dim), ("NB", blocks), ("CHUNK", chunk)], grid=(heads * blocks * 32, length, 1),
+            threadgroup=(blocks * 32, 1, 1), output_shapes=[(length, heads, blocks, dim + 2)],
+            output_dtypes=[mx.float32])[0]
     return _attn_kernel("merge")(
         inputs=[partial, sink.astype(mx.float32), mx.array([heads, blocks], dtype=mx.int32)],
         template=[("D", dim), ("T", q.dtype), ("CHUNK", chunk)],
@@ -327,6 +455,79 @@ def _index_kernel() -> Any:
                                 output_names=["scores"], source=_INDEX)
 
 
+# A prompt block's index scores as 8x8 fp32 MMAs (FP4 x FP4 products are exact; each head sums in a fixed order)
+_INDEX_MMA = r"""
+    // 32 keys in threadgroup memory x QT tiles of 8 queries (a SIMD group each): fp32 8x8 MMAs a head
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const int H = HEADS, N = meta[1], M = meta[2], start = meta[3], ratio = RATIO, L = meta[5];
+    const int k0 = int(threadgroup_position_in_grid.x) * 32;
+    const int q0 = (int(threadgroup_position_in_grid.y) * QT + int(sg)) * 8;
+    threadgroup float kt[32 * D];
+    for (uint i = thread_index_in_threadgroup; i < 32 * D; i += QT * 32) {
+        const int r = min(k0 + int(i / D), N - 1);
+        kt[i] = float(keys[size_t(r) * D + i % D]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (q0 >= L || k0 >= M) return;
+    const short qid = lane / 4;
+    const short sm = (qid & 4) + (lane / 2) % 4;
+    const short sn = (qid & 2) * 2 + (lane % 2) * 2;
+    simdgroup_matrix<float, 8, 8> acc[4];
+    for (int b = 0; b < 4; ++b) acc[b] = simdgroup_matrix<float, 8, 8>(0.0f);
+    const int qa = min(q0 + sm, L - 1);
+    for (int h = 0; h < H; ++h) {
+        simdgroup_matrix<float, 8, 8> s[4];
+        for (int b = 0; b < 4; ++b) s[b] = simdgroup_matrix<float, 8, 8>(0.0f);
+        const size_t qb = (size_t(qa) * H + h) * D + sn;
+        for (int kk = 0; kk < D; kk += 8) {
+            simdgroup_matrix<float, 8, 8> a;
+            a.thread_elements()[0] = float(q[qb + kk]);
+            a.thread_elements()[1] = float(q[qb + kk + 1]);
+            for (int b = 0; b < 4; ++b) {
+                simdgroup_matrix<float, 8, 8> bm;
+                bm.thread_elements()[0] = kt[(b * 8 + sn) * D + kk + sm];
+                bm.thread_elements()[1] = kt[(b * 8 + sn + 1) * D + kk + sm];
+                simdgroup_multiply_accumulate(s[b], a, bm, s[b]);
+            }
+        }
+        const float wq = weights[qa * H + h];
+        for (int b = 0; b < 4; ++b) {
+            acc[b].thread_elements()[0] += max(s[b].thread_elements()[0], 0.0f) * wq;
+            acc[b].thread_elements()[1] += max(s[b].thread_elements()[1], 0.0f) * wq;
+        }
+    }
+    const int qrow = q0 + sm;
+    if (qrow >= L) return;
+    const int seen = (start + qrow + 1) / ratio;
+    for (int b = 0; b < 4; ++b)
+        for (int e = 0; e < 2; ++e) {
+            const int col = k0 + b * 8 + sn + e;
+            if (col < M)
+                scores[size_t(qrow) * M + col] = (col < N && col < seen) ? acc[b].thread_elements()[e] : -INFINITY;
+        }
+"""
+INDEX_MMA = __import__("os").environ.get("TF_DSV41_INDEX_MMA", "1") != "0"
+INDEX_MMA_QT = 8
+
+
+@cache
+def _index_mma_kernel() -> Any:
+    return mx.fast.metal_kernel(name="tf_dsv41_index_scores_mma", input_names=["q", "keys", "weights", "meta"],
+                                output_names=["scores"], source=_INDEX_MMA)
+
+
+def _index_scores_mma(q: mx.array, w: mx.array, keys: mx.array, rows: int, start: int, ratio: int) -> mx.array:
+    length, heads, dim = (int(s) for s in q.shape)
+    qt = INDEX_MMA_QT
+    return _index_mma_kernel()(
+        inputs=[mx.contiguous(q), mx.contiguous(keys), mx.contiguous(w.astype(mx.float32)),
+                mx.array([heads, rows, rows, start, ratio, length], dtype=mx.int32)],
+        template=[("D", dim), ("HEADS", heads), ("RATIO", ratio), ("QT", qt)],
+        grid=((rows + 31) // 32 * qt * 32, (length + 8 * qt - 1) // (8 * qt), 1), threadgroup=(qt * 32, 1, 1),
+        output_shapes=[(length, rows)], output_dtypes=[mx.float32])[0]
+
+
 def index_fits(dims: int) -> bool:
     return metal() and dims % 32 == 0
 
@@ -339,6 +540,8 @@ def index_scores(q: mx.array, w: mx.array, keys: mx.array, rows: int, start: int
     width = rows if candidates is None else int(candidates.shape[-1])
     if not width:
         return mx.zeros((length, 0), dtype=mx.float32)
+    if candidates is None and INDEX_MMA and length > ROWS_MAX and not rows_mode() and dim % 8 == 0 and dim <= 128:
+        return _index_scores_mma(q, w, keys, rows, start, ratio)
     return _index_kernel()(
         inputs=[mx.contiguous(q), mx.contiguous(keys), mx.contiguous(w.astype(mx.float32)),
                 mx.zeros((1,), mx.int32) if candidates is None else mx.contiguous(candidates.astype(mx.int32)),
@@ -529,7 +732,7 @@ _FPQMV_ROWS = r"""
   }
 """
 
-ROWS_MAX = 16
+ROWS_MAX = 32
 _ROWS_MODE = [False]
 
 

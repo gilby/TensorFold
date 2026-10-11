@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 from typing import Any
 
 import mlx.core as mx
@@ -51,26 +52,37 @@ def round_fp4(a: mx.array) -> mx.array:
 def quantize_activation(x: mx.array, bits: int = 8, group: int = 32, e4m3_scale: bool = False) -> mx.array:
     """x rounded through FP8 or FP4 and back a ``group`` at a time (UE8M0 scales, or E4M3 with ``e4m3_scale``)."""
 
-    dtype, shape = x.dtype, x.shape
-    if shape[-1] % group:
-        raise ValueError(f"activation width {shape[-1]} does not divide by {group}")
-    g = x.astype(mx.float32).reshape(*shape[:-1], shape[-1] // group, group)
-    limit = FP8_MAX if bits == 8 else FP4_MAX
-    floor = limit * (2.0 ** -9 if e4m3_scale else 2.0 ** -126)
-    amax = mx.maximum(mx.max(mx.abs(g), axis=-1, keepdims=True), floor)
-    if e4m3_scale:
-        scale = round_fp8(amax / limit)
-    else:
-        scale = _pow2(mx.maximum(_ceil_log2(amax / limit), -126))
-    scaled = mx.clip(g / scale, -limit, limit)
-    if bits == 8:
-        q = round_fp8(scaled)
-    elif bits == 4:
-        q = round_fp4(mx.abs(scaled))
-        q = mx.where(scaled < 0, -q, q)
-    else:
+    if x.shape[-1] % group:
+        raise ValueError(f"activation width {x.shape[-1]} does not divide by {group}")
+    if bits not in (8, 4):
         raise ValueError("only FP8 and FP4 round trips are defined")
-    return (q * scale).reshape(shape).astype(dtype)
+    return _quantizer(int(bits), int(group), bool(e4m3_scale))(x)
+
+
+@functools.cache
+def _quantizer(bits: int, group: int, e4m3_scale: bool) -> Any:
+    """quantize_activation's ops as one compiled graph (the same ops, so the same bits)."""
+
+    @mx.compile
+    def run(x: mx.array) -> mx.array:
+        dtype, shape = x.dtype, x.shape
+        g = x.astype(mx.float32).reshape(*shape[:-1], shape[-1] // group, group)
+        limit = FP8_MAX if bits == 8 else FP4_MAX
+        floor = limit * (2.0 ** -9 if e4m3_scale else 2.0 ** -126)
+        amax = mx.maximum(mx.max(mx.abs(g), axis=-1, keepdims=True), floor)
+        if e4m3_scale:
+            scale = round_fp8(amax / limit)
+        else:
+            scale = _pow2(mx.maximum(_ceil_log2(amax / limit), -126))
+        scaled = mx.clip(g / scale, -limit, limit)
+        if bits == 8:
+            q = round_fp8(scaled)
+        else:
+            q = round_fp4(mx.abs(scaled))
+            q = mx.where(scaled < 0, -q, q)
+        return (q * scale).reshape(shape).astype(dtype)
+
+    return run
 
 
 def fp8(x: mx.array) -> mx.array:

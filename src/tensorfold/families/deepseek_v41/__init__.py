@@ -46,7 +46,9 @@ def weight_bytes(model_dir: str | Path, ple_on_ssd: bool = False) -> int:
     return total - engram_bytes(Path(model_dir))
 
 
-def load(model_dir: Path, **options: Any) -> tuple[Any, Any]:
+def load(model_dir: Path, *, vision: bool = False, vision_urls: bool = False, **options: Any) -> tuple[Any, Any]:
+    """The MLX engine; vision also loads the checkpoint's ViT and aligner for image prompts."""
+
     import mlx.core as mx
 
     from tensorfold.families.deepseek_v41.runtime import load as load_runtime
@@ -55,7 +57,16 @@ def load(model_dir: Path, **options: Any) -> tuple[Any, Any]:
         limit = int(mx.device_info().get("max_recommended_working_set_size", 0))
         if limit:
             mx.set_wired_limit(limit)
-    return load_runtime(Path(model_dir), **options)
+    runtime, tokenizer = load_runtime(Path(model_dir), **options)
+    if vision:
+        from tensorfold.vision.deepseek_v41_mlx import DeepSeekV41VisionFrontend
+
+        runtime.vision = DeepSeekV41VisionFrontend.load(Path(model_dir), tokenizer, runtime.model.embed_tokens,
+                                                        allow_urls=vision_urls)
+        print(f"[tensorfold] DeepSeek-V4.1 image encoder: {runtime.vision.weight_bytes() / 1024**3:.2f} GiB of "
+              f"weights, {runtime.vision.workspace_bytes / 1024**3:.2f} GiB workspace at a 1,024-token image",
+              flush=True)
+    return runtime, tokenizer
 
 
 def engine_settings(model: Any) -> dict[str, Any]:

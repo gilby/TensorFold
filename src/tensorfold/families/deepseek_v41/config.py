@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 # the decode path's widest call: wider inputs (prompt chunks) take the batched prefill path
-DECODE_ROWS = 16
+DECODE_ROWS = 32
 # prompt rows an attention call takes at once (bounds the score matrix)
 PREFILL_QUERIES = 256
 # prompt rows an index call scores at once (its fp32 scores are [rows, heads, context])

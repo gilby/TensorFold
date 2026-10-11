@@ -35,7 +35,7 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
     endpoint.add_argument("--api-key-file", help="restricted key file, one key or label: key per line; # comments")
     endpoint.add_argument("--metrics-open", action="store_true", help="allow metrics without an API key")
     endpoint.add_argument("--vision", action="store_true",
-                          help="enable image input for supported GLM and Qwen vision checkpoints")
+                          help="enable image input for supported GLM, DeepSeek-V4.1 and Qwen vision checkpoints")
     endpoint.add_argument("--vision-urls", action="store_true",
                           help="with --vision, accept public HTTP(S) image URLs (default: data URLs only)")
     endpoint.add_argument("--vision-offload", action="store_true",

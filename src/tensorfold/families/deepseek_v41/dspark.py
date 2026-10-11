@@ -58,9 +58,16 @@ class DSparkBlock:
         return self.block.arrays()
 
     def __call__(self, h: mx.array, pre: mx.array, cache: LayerCache) -> tuple[mx.array, mx.array]:
+        return self.streams(h, pre, [cache], int(h.shape[0]))
+
+    def streams(self, h: mx.array, pre: mx.array, caches: list[LayerCache], rows: int) -> tuple[mx.array, mx.array]:
+        """Several streams' blocks of rows rows each in one pass: attention stream by stream."""
+
         b = self.block
         ap, ao, ac = b.attn_hc(h)
-        h = KV.hc_post(self.attn(rms(hc_pre(h, pre), b.attn_norm, b.eps), cache), h, ao, ac)
+        x = rms(hc_pre(h, pre), b.attn_norm, b.eps)
+        a = [self.attn(x[i * rows:(i + 1) * rows], cache) for i, cache in enumerate(caches)]
+        h = KV.hc_post(mx.concatenate(a) if len(a) > 1 else a[0], h, ao, ac)
         fp, fo, fc = b.ffn_hc(h)
         return KV.hc_post(b.moe(rms(hc_pre(h, ap), b.ffn_norm, b.eps)), h, fo, fc), fp
 
@@ -98,6 +105,35 @@ class DSpark:
             x, pre = block(x, pre, cache)
         normed = rms(hc_pre(x, pre), self.norm, self.eps)
         return KV.head_logits(normed, model.lm_head, False)
+
+    def logits_streams(self, model: DeepSeekV41, tokens: list[mx.array],
+                       caches: list[list[LayerCache]]) -> mx.array:
+        """logits for several streams in one pass of the blocks: [streams, size, V]."""
+
+        n = len(tokens)
+        noise = mx.full((self.size - 1,), self.noise, mx.uint32)
+        ids = mx.concatenate([part for t in tokens for part in (t.reshape(1).astype(mx.uint32), noise)])
+        h = model.embed_tokens(ids)
+        rows = n * self.size
+        x = mx.contiguous(mx.broadcast_to(h[:, None, :], (rows, self.hc, h.shape[-1])))
+        pre = mx.broadcast_to((mx.arange(self.hc) == 0).astype(mx.float32), (rows, self.hc))
+        for k, block in enumerate(self.blocks):
+            x, pre = block.streams(x, pre, [c[k] for c in caches], self.size)
+        normed = rms(hc_pre(x, pre), self.norm, self.eps)
+        return KV.head_logits(normed, model.lm_head, False).reshape(n, self.size, -1)
+
+    def draw_streams(self, logits: mx.array, tokens: list[mx.array], counts: list[int], draws: list[Any]) -> list[Any]:
+        """draw for several streams, each step's Markov bias for every stream from one read of its head."""
+
+        prev = [t.reshape(1).astype(mx.uint32) for t in tokens]
+        out: list[list[mx.array]] = [[] for _ in tokens]
+        for j in range(max(counts, default=0)):
+            live = [i for i, c in enumerate(counts) if c > j]
+            bias = KV.head_logits(self.markov_embed[mx.concatenate([prev[i] for i in live])], self.markov_head, False)
+            for r, i in enumerate(live):
+                prev[i] = draws[i](logits[i, j:j + 1].astype(mx.float32) + bias[r:r + 1], j)
+                out[i].append(prev[i].reshape(1).astype(mx.uint32))
+        return [mx.concatenate(d) if d else [] for d in out]
 
     def draw(self, logits: mx.array, token: mx.array, count: int, draw: Any) -> mx.array:
         """``count`` drafts one after another, each row's logits plus the Markov bias of the token before it."""

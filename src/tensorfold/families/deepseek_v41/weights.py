@@ -122,7 +122,8 @@ def load_moe(w: Weights, p: str, cfg: Config, *, top: int | None = None) -> MoE:
     return MoE(w.get(f"{f}.gate.weight"), w.get(f"{f}.gate.bias"), w.experts(f"{f}.experts.w1"),
                w.experts(f"{f}.experts.w3"), w.experts(f"{f}.experts.w2"), w.lin(f"{f}.shared_experts.w1"),
                w.lin(f"{f}.shared_experts.w3"), w.lin(f"{f}.shared_experts.w2"),
-               cfg.num_experts_per_tok if top is None else top, cfg.routed_scaling_factor, cfg.swiglu_limit)
+               cfg.num_experts_per_tok if top is None else top, cfg.routed_scaling_factor, cfg.swiglu_limit,
+               w.get(f"{f}.gate.bias_vl") if w.has(f"{f}.gate.bias_vl") else None)
 
 
 def load_engram(w: Weights, p: str, cfg: Config) -> Engram:

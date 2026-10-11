@@ -151,10 +151,10 @@ def test_prefill_path_agrees_with_decode_path(model, length):
 
 
 def test_chunked_prefill_agrees_with_one_chunk(model):
-    ids = tokens(61, seed=3)
+    ids = tokens(100, seed=3)               # every chunk wider than DECODE_ROWS: the prompt path throughout
     a = logits_of(model, ids, model.make_cache())
     parts = model.make_cache()
-    b = mx.concatenate([logits_of(model, ids[lo:hi], parts) for lo, hi in ((0, 17), (17, 32), (32, 61))])
+    b = mx.concatenate([logits_of(model, ids[lo:hi], parts) for lo, hi in ((0, 33), (33, 66), (66, 100))])
     assert agree(a, b)
 
 
@@ -482,3 +482,111 @@ def test_metal_keep_rows_and_streams(gpu_model):
     assert width == 16
     runtime.exact_width = width
     assert runtime.check_streams()
+
+
+@pytest.mark.parametrize("lengths", [(1, 1, 1, 1), (4, 4, 4, 4), (5, 1, 3, 7), (2, 2, 2, 2, 2, 2, 2, 2)])
+def test_metal_many_streams_one_forward(gpu_model, lengths):
+    from tensorfold.engine.lane_engine import LaneEngine
+
+    mx.set_default_device(mx.gpu)
+    model = gpu_model
+    bases = []
+    for b in range(len(lengths)):
+        c = model.make_cache()
+        mx.eval(model.hidden(mx.array([tokens(6 + 9 * b, seed=20 + b)], dtype=mx.uint32), c))
+        bases.append(c)
+    wins = [tokens(n, seed=40 + b) for b, n in enumerate(lengths)]
+    alone = [logits_of(model, w, LaneEngine.copy_single_cache(c)) for w, c in zip(wins, bases)]
+    flat = mx.array([t for w in wins for t in w], dtype=mx.uint32)
+    joint = model.head(model.hidden_rows(flat, [LaneEngine.copy_single_cache(c) for c in bases], list(lengths)))[0]
+    at = 0
+    for b, (w, a) in enumerate(zip(wins, alone)):
+        assert mx.array_equal(joint[at:at + len(w)], a).item(), f"stream {b}"
+        at += len(w)
+
+
+@pytest.mark.parametrize("rows", [1, 2, 7, 16, 32, 33, 40])
+def test_metal_head_rows_share_reads_with_one_row_bits(rows):
+    from tensorfold.kernels.deepseek.v41 import rows as KV
+
+    if not mx.metal.is_available():
+        pytest.skip("needs Metal")
+    mx.set_default_device(mx.gpu)
+    w = (mx.random.normal((4099, 1024), key=mx.random.key(1)) * 0.05).astype(mx.bfloat16)
+    x = (mx.random.normal((rows, 1024), key=mx.random.key(2)) *
+         mx.random.uniform(0.1, 10, (rows, 1), key=mx.random.key(3))).astype(mx.bfloat16)
+    joint = KV.head_logits(x, w, True)
+    for r in range(rows):
+        assert mx.array_equal(joint[r:r + 1], KV.head_logits(x[r:r + 1], w, True)).item(), f"row {r}"
+    ref = x.astype(mx.float64 if False else mx.float32) @ w.astype(mx.float32).T
+    assert float(mx.max(mx.abs(joint - ref)).item()) < 1e-3
+
+
+@pytest.mark.parametrize(("length", "W", "C"), [(1, 128, 512), (16, 128, 512), (256, 128, 512), (64, 128, 0), (7, 100, 37)])
+def test_metal_attention_head_groups_keep_each_heads_bits(length, W, C):
+    from tensorfold.kernels.deepseek.v41 import rows as KV
+
+    if not mx.metal.is_available():
+        pytest.skip("needs Metal")
+    mx.set_default_device(mx.gpu)
+    ks = mx.random.split(mx.random.key(length + W + C), 6)
+    q = mx.random.normal((length, 64, 512), key=ks[0]).astype(mx.bfloat16)
+    win = mx.random.normal((W + 16, 512), key=ks[1])
+    pooled = mx.random.normal((max(C, 1) * 4, 512), key=ks[2]).astype(mx.bfloat16)
+    wi = mx.random.randint(-1, W + 16, (length, W), key=ks[3]).astype(mx.int32)
+    ci = mx.sort(mx.random.randint(-1, max(C, 1) * 4, (length, C), key=ks[4]).astype(mx.int32), axis=-1)
+    sink = mx.random.normal((64,), key=ks[5])
+    previous = KV.ATTN_HEAD_GROUP
+    try:
+        outs = []
+        for g in (1, 2, 4, 8):
+            KV.ATTN_HEAD_GROUP = g
+            outs.append(KV.attention(q, win, pooled, wi, ci, sink, 0.04))
+    finally:
+        KV.ATTN_HEAD_GROUP = previous
+    for o in outs[1:]:
+        assert mx.array_equal(o, outs[0]).item()
+
+
+@pytest.mark.parametrize("prompt", [6, 300])
+def test_metal_32_row_windows_give_one_row_bits(gpu_model, prompt):
+    from tensorfold.engine.lane_engine import LaneEngine
+
+    mx.set_default_device(mx.gpu)
+    model = gpu_model
+    base = model.make_cache()
+    mx.eval(model.hidden(mx.array([tokens(prompt, seed=15)], dtype=mx.uint32), base))
+    window = tokens(32, seed=16)
+    serial, _ = serial_logits(model, base, window)
+    joint = logits_of(model, window, LaneEngine.copy_single_cache(base))
+    for i in range(32):
+        assert mx.array_equal(joint[i], serial[i]).item(), f"row {i}"
+
+
+def test_metal_eight_streams_of_four_rows(gpu_model):
+    test_metal_many_streams_one_forward(gpu_model, (4, 4, 4, 4, 4, 4, 4, 4))
+
+
+@pytest.mark.parametrize(("length", "rows", "start", "ratio"), [(33, 50, 0, 1), (100, 200, 300, 2), (257, 1000, 1743, 1),
+                                                                (2048, 3000, 4000, 2)])
+def test_metal_prompt_index_scores_match_the_pair_kernel(length, rows, start, ratio):
+    from tensorfold.families.deepseek_v41.quant import quantize_activation
+    from tensorfold.kernels.deepseek.v41 import rows as KV
+
+    if not mx.metal.is_available():
+        pytest.skip("needs Metal")
+    mx.set_default_device(mx.gpu)
+    ks = mx.random.split(mx.random.key(length + rows), 3)
+    q = quantize_activation((mx.random.normal((length, 32, 128), key=ks[0]) * 2).astype(mx.bfloat16), 4, 32)
+    keys = quantize_activation(mx.random.normal((rows + 5, 128), key=ks[1]).astype(mx.bfloat16), 4, 32)
+    w = mx.random.normal((length, 32), key=ks[2]) * 0.02
+    fast = KV.index_scores(q, w, keys, rows, start, ratio)
+    previous = KV.INDEX_MMA
+    try:
+        KV.INDEX_MMA = False
+        pair = KV.index_scores(q, w, keys, rows, start, ratio)
+    finally:
+        KV.INDEX_MMA = previous
+    assert mx.array_equal(fast, pair).item()
+    if length > 64:                       # a query's scores do not depend on the other queries of its block
+        assert mx.array_equal(KV.index_scores(q[:64], w[:64], keys, rows, start, ratio), fast[:64]).item()

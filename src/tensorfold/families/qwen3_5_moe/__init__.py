@@ -14,7 +14,7 @@ MODELS = ("TensorFold/Qwen3.6-35B-A3B-MLX-4bit-MTP", "mlx-community/Qwen3.6-35B-
           "UnstableLlama/Qwen3.6-35B-A3B-exl3-4.00bpw")
 # CUDA also reads ModelOpt checkpoints (FP8 / NVFP4 projections, W4A16 NVFP4 experts) and EXL3 packs of any codebook
 # and width; both draft with a bf16 MTP layer (their own, or mtp.safetensors beside an EXL3 pack, which drops it)
-QUANT_METHODS = {"cuda": ("mlx", "modelopt", "exl3")}
+QUANT_METHODS = {"cuda": ("mlx", "modelopt", "exl3"), "mlx": ("mlx", "exl3")}
 EXL3_VARIANT = "any"                           # tensorfold.families.EXL3_VARIANT_ANY
 REQUIRED_FILES = {MODELS[0]: ("mtp-4bit.safetensors",)}
 DRAFTER = ""                  # Macs and CUDA draft with the checkpoint's MTP layer; --drafter takes a DFlash v1 model
@@ -32,9 +32,14 @@ def check(model_dir: str | Path) -> None:
 
     import sys
 
-    from tensorfold.families import OWN_MODEL_HELP, describe_quantization, quantization, read_config
+    from tensorfold.families import OWN_MODEL_HELP, describe_quantization, quant_method, quantization, read_config
 
     config = read_config(model_dir)
+    if sys.platform == "darwin" and quant_method(config) == "exl3":
+        from tensorfold.cuda.exl3 import format as exl3_format
+
+        exl3_format.require_config(config, where=f"{TITLE} on a Mac", tested=MODELS[3], help=OWN_MODEL_HELP)
+        return                               # every codebook and width; the loader checks each tensor's
     if sys.platform == "darwin":
         # the Mac engine is the dense family's row decoder (load below), whose per-module affine reads cover
         # mixed widths and groups (oQ-style checkpoints); its refusal is the one that applies here
@@ -79,7 +84,16 @@ def load(model_dir: Path, *, drafter: str = "", drafter_bits: int = 4, mtp_draft
 
     from tensorfold.families.qwen3_5 import lane_family, load_lane_model
 
-    model, tokenizer = load_lane_model(Path(model_dir))
+    from .exl3 import is_exl3
+
+    if is_exl3(model_dir):                    # EXL3 packs: their trellis tiles, decoded by kernels.exl3
+        from .exl3 import load_model
+        from .exl3_rows import install
+
+        model, tokenizer = load_model(Path(model_dir))
+        install(model.language_model.model)
+    else:
+        model, tokenizer = load_lane_model(Path(model_dir))
     if drafter:
         return lane_family(model, lanes=False, drafter=drafter, drafter_bits=drafter_bits, title=TITLE,
                            use=MODELS[1]), tokenizer
@@ -110,6 +124,11 @@ def kernel_version(model: Any) -> str:
     parts = [getattr(row_matmul.BACKEND, "name", "simd_qmm"), f"row_attention={row_forward.ROW_ATTENTION}",
              f"moe_rows={row_forward.MOE_ROWS}",
              *(path.read_text() for path in sorted(Path(row_forward.__file__).parent.glob("*.py")))]
+    if getattr(getattr(model, "inner", model), "_tensorfold_exl3", False):
+        from tensorfold.kernels import exl3
+
+        parts += ["exl3", *(path.read_text() for path in sorted(Path(exl3.__file__).parent.glob("*.py"))),
+                  *(path.read_text() for path in sorted(Path(__file__).parent.glob("exl3*.py")))]
     return f"qwen3_5_moe-{KERNEL_VERSION}-" + hashlib.sha256("\n".join(parts).encode()).hexdigest()[:12]
 
 

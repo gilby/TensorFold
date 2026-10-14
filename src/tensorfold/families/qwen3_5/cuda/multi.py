@@ -20,10 +20,17 @@ from .decode_tp import SAMPLING_WORDS as W, _sample_split, _share, first_token, 
 from .draft_tree import allocate
 from .engine import entry_end
 from .forward import State, _paths, commit, commit_streams, multi_tree_forward, path_indices, reserve
-from .prefill import CHUNK, Piece, prefill_batch, prefill_state
+from .prefill import CHUNK, Piece, prefill_batch, prefill_rows, prefill_state
 from .weights import Weights
 
 ADMIT, ROUND, DONE, FILL, FILLS, ROOM, EVICT, GROW = 1, 2, 3, 4, 5, 6, 7, 8   # rank 0's messages
+DECIDE, DSTEP, DSTEPS = 9, 10, 11       # a decision prompt (adapter on, every row's state, no token), its steps
+# whole short decisions in one forward: off by default, since an EXL3 pack's prompt GEMMs round a row differently in a
+# batch (a decision's probabilities would then depend on what else arrived), and sm_70 ranks gain nothing from it
+DECISION_BATCH = __import__("os").environ.get("TF_DECISION_BATCH", "0") == "1"
+# a decision's prompt attention on sm_70: fp32 scores (``blocked``) by default; the head reads every row, and fp16
+# scores (chat's ``blocked16``) moved long 64-question records further from Cloudflare's bf16 pipeline
+DECISION_ATTN = __import__("os").environ.get("TF_DECISION_PROMPT_ATTN", "blocked")
 COPY, TREE, ONE = 0, 1, 2               # a stream's window this round
 STEP = 1024                             # prompt rows a prefill step takes while other streams decode
 TAIL_MERGE = os.environ.get("TENSORFOLD_PREFILL_TAIL_MERGE", "1") != "0"   # a short tail after the last stop: one call
@@ -148,6 +155,9 @@ class MultiDecoder:
         self.split = world > 1 and world * w.head.n == w.config.vocab    # each rank holds its share of the head
         self.drafts = draft is not None and (rank == 0 or getattr(draft, "world", 1) > 1)
         self.streams: dict[int, Stream] = {}                  # decoding
+        self.adapters: dict = {}                              # name -> adapters.Adapter (the same order on every rank)
+        self.deciding: list = []                              # decision prompts prefilling (oldest first)
+        self.decide_turn = False                              # decisions and chat prompts take prefill steps in turn
         self.filling: list[Stream] = []                        # admitted, prompts still prefilling (oldest first)
         self.points = points                                  # a prompt's message starts to keep states at, or None
         self.cache = PrefixCache(keep)
@@ -173,7 +183,7 @@ class MultiDecoder:
                                           live=self._fullest if world > 1 else self.local_live)
 
     def live(self) -> int:
-        return len(self.streams) + len(self.filling)
+        return len(self.streams) + len(self.filling) + len(self.deciding)
 
     def _fullest(self) -> int:
         """Rank 0 of several: the least free memory of any rank, each answering a ROOM message."""
@@ -208,6 +218,10 @@ class MultiDecoder:
         """Queue a request on the longest cached prefix of its prompt; rounds prefill the rest a step at a time."""
 
         self._check()
+        from .decisions import Decision
+
+        if isinstance(s, Decision):
+            return self._admit_decision(s)
         if self.context:
             room = self.context - len(s.prompt) - 1
             if room < 1:
@@ -473,7 +487,11 @@ class MultiDecoder:
 
         self._check()
         self._timed(time.perf_counter())
-        done = self._fill() if self.filling else []
+        if self.deciding and (not self.filling or self.decide_turn):
+            done = self._decide()
+        else:
+            done = self._fill() if self.filling else []
+        self.decide_turn = not self.decide_turn
         start = time.perf_counter()
         live = [s for s in self.streams.values() if not s.done]
         if self.memory_gate is not None:
@@ -857,9 +875,139 @@ class MultiDecoder:
             for (s, _), snap in zip(drafting, snaps):
                 s.snap = snap
 
+    def _admit_decision(self, d) -> None:
+        """Queue a decision prompt: its caches hold the whole prompt now (it only prefills), within the memory gate."""
+
+        if d.adapter not in self.adapters:
+            raise ValueError(f"no adapter {d.adapter!r} on this engine (TF_ADAPTERS)")
+        if self.context and len(d.prompt) > self.context:
+            raise ValueError(f"a {len(d.prompt)}-token decision exceeds the {self.context}-token context")
+        if self.memory_gate is not None:
+            while not self.memory_gate.fits(len(d.prompt) * self.row_bytes):
+                if not self._evict():
+                    if not self.live():
+                        break
+                    raise NoRoom(f"a {len(d.prompt)}-token decision waits for memory until a live stream finishes")
+                torch.cuda.empty_cache()
+        d.sid = self.next_id
+        self.next_id += 1
+        self._send([DECIDE, d.sid, list(self.adapters).index(d.adapter)])
+        self._send(list(d.prompt))
+        self._queue_decision(d)
+
+    def _queue_decision(self, d) -> None:
+        d.st = private(State(self.w), len(d.prompt))
+        self.deciding.append(d)
+
+    def _decide(self) -> list:
+        """A prefill step for decisions: whole short ones in one forward, else the oldest STEP rows (or a forward's)
+        further while streams decode; returns the decisions that finished, every row's final state on rank 0."""
+
+        room = STEP if any(not x.done for x in self.streams.values()) else getattr(self.w, "prompt_rows", CHUNK)
+        batch, left = [], room
+        for d in (self.deciding if DECISION_BATCH else ()):
+            if d.st.pos or len(d.prompt) > left:
+                break
+            batch.append(d)
+            left -= len(d.prompt)
+        try:
+            if len(batch) > 1:
+                self._send([DSTEPS, len(batch), *[d.sid for d in batch]])
+                self._dsteps(batch)
+            else:
+                d = self.deciding[0]
+                stop = min(len(d.prompt), d.st.pos + room)
+                self._send([DSTEP, d.sid, stop])
+                self._dstep(d, stop)
+        except Exception as exc:                 # noqa: BLE001  (one GPU: these decisions fail, the others go on)
+            if self.world > 1:
+                raise
+            failed = batch if len(batch) > 1 else [self.deciding[0]]
+            for d in failed:
+                d.error, d.done, d.st = exc, True, None
+            self.deciding = [d for d in self.deciding if not d.done]
+            return failed
+        return self._decided()
+
+    def _decided(self) -> list:
+        out = [d for d in self.deciding if d.st.pos == len(d.prompt)]
+        for d in out:
+            d.done, d.st = True, None
+            if self.rank == 0:
+                d.hidden = torch.cat(d.rows) if len(d.rows) > 1 else d.rows[0]
+                if d.on_hidden is not None:      # the head here, on this thread: never beside a graph capture
+                    try:
+                        d.result = d.on_hidden(d.hidden)
+                    except Exception as exc:     # noqa: BLE001  (this decision fails, the others go on)
+                        d.error = exc
+                    d.hidden = None
+            d.rows = []
+        if out:
+            self.deciding = [d for d in self.deciding if not d.done]
+            torch.cuda.empty_cache()
+        return out
+
+    def _dstep(self, d, stop: int) -> None:
+        """Prefill a decision's prompt[pos:stop] with its adapter on; rank 0 keeps every new row's final state."""
+
+        from tensorfold.cuda.kernels import prefill_attention
+
+        from . import adapters
+
+        t0 = time.perf_counter()
+        before, prefill_attention.MODE = prefill_attention.MODE, DECISION_ATTN or None
+        try:
+            with adapters.applied(self.adapters[d.adapter]):
+                rows = prefill_state(self.w, d.prompt[:stop], d.st, tp=self.world > 1, every=True)
+        except Exception as exc:
+            if self.world > 1:
+                self.broken = exc
+            raise
+        finally:
+            prefill_attention.MODE = before
+            d.prefill_s += time.perf_counter() - t0
+        if self.rank == 0:
+            d.rows.append(rows)
+        if self.rank != 0:
+            self._decided()
+
+    def _dsteps(self, batch: list) -> None:
+        """Whole decisions of one adapter in one forward (``prefill_rows``): each row's bits as it alone gives them."""
+
+        from . import adapters
+
+        from tensorfold.cuda.kernels import prefill_attention
+
+        t0 = time.perf_counter()
+        before, prefill_attention.MODE = prefill_attention.MODE, DECISION_ATTN or None
+        groups: dict = {}
+        for d in batch:
+            groups.setdefault(d.adapter, []).append(d)
+        try:
+            for name, ds in groups.items():
+                with adapters.applied(self.adapters[name]):
+                    outs = prefill_rows(self.w, [(d.prompt, d.st, 0) for d in ds], tp=self.world > 1, every=True)
+                for d, (normed, _, _) in zip(ds, outs):
+                    if self.rank == 0:
+                        d.rows.append(normed)
+        except Exception as exc:
+            if self.world > 1:
+                self.broken = exc
+            raise
+        finally:
+            prefill_attention.MODE = before
+            spent = time.perf_counter() - t0
+            for d in batch:
+                d.prefill_s += spent
+        if self.rank != 0:
+            self._decided()
+
     def finish(self, done: list[Stream]) -> None:
         """Drop finished streams on every rank (their prompt-end states joined the prefix cache at admission)."""
 
+        from .decisions import Decision
+
+        done = [s for s in done if not isinstance(s, Decision)]
         if done:
             self._send([DONE, len(done), *[s.sid for s in done]])
             for s in done:
@@ -874,8 +1022,8 @@ class MultiDecoder:
         live = [s for s in self.streams.values() if not s.done]
         for s in live:
             del self.streams[s.sid]
-        live += self.filling
-        self.filling = []
+        live += self.filling + self.deciding
+        self.filling, self.deciding = [], []
         if self.world > 1 and self.broken is None:
             self.broken = RuntimeError("a round failed")
         return live
@@ -929,6 +1077,16 @@ class MultiDecoder:
             elif msg[0] == DONE:
                 for sid in msg[2:2 + msg[1]]:
                     self._finish(sid)
+            elif msg[0] == DECIDE:
+                from .decisions import Decision
+
+                d = Decision(_share(None, self.rank, self.device), list(self.adapters)[msg[2]])
+                d.sid = msg[1]
+                self._queue_decision(d)
+            elif msg[0] == DSTEP:
+                self._dstep(next(d for d in self.deciding if d.sid == msg[1]), msg[2])
+            elif msg[0] == DSTEPS:
+                self._dsteps([next(d for d in self.deciding if d.sid == sid) for sid in msg[2:2 + msg[1]]])
             elif msg[0] == ROOM:
                 self._room_gather()
             elif msg[0] == EVICT:

@@ -106,6 +106,8 @@ def make_handler(app: App):
             path = self.path.split("?", 1)[0].rstrip("/")
             if path.endswith("/decisions"):
                 return self._post_decisions()
+            if path.endswith("/systemone"):
+                return self._post_systemone()
             if anthropic.route(self.path):
                 return anthropic.post(self, app)
             if responses.route(self.path) == "":         # a Response: this handler's chat completion, translated
@@ -242,6 +244,39 @@ def make_handler(app: App):
                            "usage": usage, "tensorfold": result["stats"]}
             if result.get("stop_sequence") is not None:
                 payload["stop_sequence"] = result["stop_sequence"]
+            self._json(200, payload)
+
+        def _post_systemone(self) -> None:
+            """Cloudflare Clef's ``/v1/systemone`` (a runtime adapter and its joint schema head; no text)."""
+
+            from .server import ContextOverflow
+
+            decide = getattr(app, "systemone", None)
+            if decide is None or not getattr(app, "decision_models", None):
+                self._discard_body()
+                return self._json(404, {"error": {"message": "no decision model on this server (TF_ADAPTERS)",
+                                                  "type": "invalid_request_error"}})
+            try:
+                body = json.loads(read_body(self) or b"{}")
+                if not isinstance(body, dict):
+                    raise RequestError("request body must be an object")
+            except RequestError as exc:
+                return self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
+            except Exception as exc:        # noqa: BLE001 - a bad body is a client error
+                return self._json(422, {"error": {"message": _error_message(exc), "type": "invalid_request_error"}})
+            try:
+                payload = decide(body)
+            except ContextOverflow as exc:
+                return self._json(413, {"error": {"message": str(exc), "type": "invalid_request_error"}})
+            except RequestError as exc:
+                return self._json(503 if isinstance(exc, CapacityError) else 400,
+                                  {"error": {"message": str(exc), "type": "invalid_request_error"}})
+            except Exception as exc:        # a failure here is the server's, not a bad body
+                _log_error(exc)
+                try:
+                    return self._json(500, {"error": {"message": _error_message(exc)}})
+                except OSError:
+                    return
             self._json(200, payload)
 
         def _post_decisions(self) -> None:

@@ -33,6 +33,10 @@ from tensorfold.server.text import is_title_request, reasoning_count, split_thin
 from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
 
 
+class ContextOverflow(RequestError):
+    """A decision record that does not fit and was sent with ``truncate`` false (oMLX answers 413)."""
+
+
 # -- requests --------------------------------------------------------------------------------
 
 _MADE = threading.Lock()                # guards the lazily made per-app ``Turns``
@@ -97,16 +101,61 @@ class App:
         if self.context_window < 0:
             raise ValueError("context_window must be 0 or a positive token count")
         self.turns = Turns()                # one request at a time where the engine decodes one
+        for name in self.decision_models:   # decision heads load now, before any round could be capturing a graph
+            self._decision_head(name)
 
     @property
     def model_ids(self) -> list[str]:
         """The ids this endpoint answers to, as the MLX server lists them: ``--name`` first, then each ``--alias``."""
 
         ids: list[str] = []
-        for model_id in (self.served, *getattr(self, "aliases", ())):
+        for model_id in (self.served, *getattr(self, "aliases", ()), *self.decision_models):
             if model_id and model_id not in ids:
                 ids.append(model_id)
         return ids
+
+    @property
+    def decision_models(self) -> list[str]:
+        """The engine's runtime adapters (``TF_ADAPTERS``): each answers ``/v1/systemone`` under its own name."""
+
+        return list(getattr(self.engine, "adapters", None) or {})
+
+    def systemone(self, body: dict[str, Any]) -> dict[str, Any]:
+        """A Jev/SystemOne decision (Cloudflare Clef): the record's prompt prefills with the adapter named by
+        ``model``, and its joint schema head gives each question's option probabilities. No text is generated."""
+
+        name = body.get("model")
+        if name not in self.decision_models:
+            raise RequestError(f"model {name!r} is not a decision model here; decision models: "
+                               f"{', '.join(self.decision_models) or 'none (TF_ADAPTERS)'}")
+        head = self._decision_head(name)
+        try:
+            head.check(body)
+        except ValueError as exc:
+            raise RequestError(str(exc)) from exc
+        truncate = body.get("truncate", True)
+        if not isinstance(truncate, bool):
+            raise RequestError("truncate must be a boolean")
+        try:
+            enc, prepared = head.encode(body, truncate=truncate, vision=self.vision,
+                                        limits=getattr(self, "image_limits", None))
+        except OverflowError as exc:
+            raise ContextOverflow(str(exc)) from exc
+        except ValueError as exc:
+            raise RequestError(str(exc)) from exc
+        out = self.engine.decide(list(enc.input_ids), name, on_hidden=lambda rows: head.answer(body, enc, rows),
+                                 **({"vision": prepared} if prepared is not None else {}))
+        reply = out["result"]
+        reply["timing"] = {"prefill_s": round(out["prefill_s"], 4), "seconds": round(out["seconds"], 4)}
+        return reply
+
+    def _decision_head(self, name: str):
+        heads = self.__dict__.setdefault("_heads", {})
+        if name not in heads:
+            from tensorfold.families.qwen3_5.cuda.decisions import Head, configured
+
+            heads[name] = Head(configured()[name], self.tok, self.engine.w.norm.device)
+        return heads[name]
 
     def reply_model(self, body: Any) -> str:
         """The id a reply names: the one the request asked for when this endpoint answers to it, else ``--name``."""
@@ -364,6 +413,8 @@ class App:
         return None
 
     def prepare(self, body: dict[str, Any], chat: bool) -> PreparedRequest:
+        if isinstance(body, dict) and body.get("model") in self.decision_models:
+            raise RequestError(f"{body['model']} is a decision model: POST /v1/systemone")
         problem = self._check_fields(body)
         if problem:
             raise refusal(problem)

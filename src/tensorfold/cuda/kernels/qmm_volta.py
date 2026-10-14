@@ -20,7 +20,7 @@ FRAG_ALWAYS_FROM_K = 16384
 @lru_cache(maxsize=1)
 def _ext():
     here = Path(__file__).parent
-    return load(name="tensorfold_qmm_volta_v2", sources=[str(here / "qmm_volta.cu")], need=VOLTA,
+    return load(name="tensorfold_qmm_volta_v3", sources=[str(here / "qmm_volta.cu")], need=VOLTA,
                 extra_cuda_cflags=["-O3"], extra_ldflags=_cublaslt_flags(), verbose=False)
 
 

@@ -239,6 +239,15 @@ def _merge(PO, PM, PL, OUT, STREAM, ROWS, W, H: tl.constexpr, D: tl.constexpr, G
     tl.store(OUT + (node * H + head[:, None]) * D + d[None, :], result.to(tl.bfloat16), mask=gg[:, None] < G)
 
 
+def decode_v4() -> bool:
+    """``TF_DECODE_ATTN``: ``v4`` (the default on sm_70: values read coalesced and kept row-major, packed rows
+    dequantized to fp16 in one rounding) or ``v2`` (the transposed-value kernel and bf16 dequant, as before)."""
+
+    import os
+
+    return os.environ.get("TF_DECODE_ATTN", "v4") != "v2"
+
+
 VOLTA_GROUP = 8         # query heads a key head the sm_70 kernel takes (QUERY_TILE for the Triton ones)
 
 
@@ -251,7 +260,7 @@ def _volta_ext():
     from tensorfold.cuda.build import VOLTA, load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_attention_volta_v2", sources=[str(here / "attention_volta.cu")], need=VOLTA,
+    return load(name="tensorfold_attention_volta_v6", sources=[str(here / "attention_volta.cu")], need=VOLTA,
                 extra_cuda_cflags=["-O3", f"-I{here}"], verbose=False)
 
 
@@ -413,7 +422,7 @@ def attention(q: torch.Tensor, k_nodes: torch.Tensor, v_nodes: torch.Tensor, off
         if qb:
             raise ValueError("the sm_70 attention kernel reads bf16 caches, not packed int8 rows")
         _volta_ext().chunks(q, k_nodes, v_nodes, origin, offs, p.streams, p.rows, p.paths, p.depths,
-                            partial_o, partial_m, partial_l, p.chunks, scale)
+                            partial_o, partial_m, partial_l, p.chunks, scale, decode_v4())
     else:
         if p.items.shape[0]:
             _shared[(p.items.shape[0] * hk,)](q, origin, origin, offs, p.streams, p.items, partial_o, partial_m,

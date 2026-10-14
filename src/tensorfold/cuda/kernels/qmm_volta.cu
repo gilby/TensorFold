@@ -318,12 +318,13 @@ struct LtPlan {
 };
 constexpr int PLAN_ROWS = 4096;                                // the row count the algorithm is chosen for
 
-std::map<std::tuple<int, long, long>, LtPlan> lt_plans;        // by (device, N, K), kept for the process
+std::map<std::tuple<int, long, long, bool>, LtPlan> lt_plans;  // by (device, N, K, fp16 out), kept for the process
 std::mutex lt_lock;
 
-const LtPlan& lt_plan(cublasLtHandle_t handle, int device, long N, long K) {
+// ``half_out``: fp16 results (fp32 sums scaled by alpha, rounded once), else fp32 sums
+const LtPlan& lt_plan(cublasLtHandle_t handle, int device, long N, long K, bool half_out = false) {
     std::lock_guard<std::mutex> guard(lt_lock);
-    const auto key = std::make_tuple(device, N, K);
+    const auto key = std::make_tuple(device, N, K, half_out);
     auto it = lt_plans.find(key);
     if (it != lt_plans.end()) return it->second;
     LtPlan p;
@@ -331,7 +332,7 @@ const LtPlan& lt_plan(cublasLtHandle_t handle, int device, long N, long K) {
     const cublasOperation_t trans = CUBLAS_OP_T;
     LT_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSA, &trans, sizeof(trans)));
     LT_CHECK(cublasLtMatrixLayoutCreate(&p.weight, CUDA_R_16F, K, N, K));
-    const LtLayout rows(CUDA_R_16F, K, PLAN_ROWS, K), sums(CUDA_R_32F, N, PLAN_ROWS, N);
+    const LtLayout rows(CUDA_R_16F, K, PLAN_ROWS, K), sums(half_out ? CUDA_R_16F : CUDA_R_32F, N, PLAN_ROWS, N);
     const LtPreference pref;
     const size_t workspace = 0;
     LT_CHECK(cublasLtMatmulPreferenceSetAttribute(pref.h, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace,
@@ -468,7 +469,26 @@ torch::Tensor gemm(torch::Tensor x16, torch::Tensor w16) {
     return out;
 }
 
+// fp16 rows x fp16 (N, K) -> fp16 (M, N) = alpha * the fp32 sums, rounded once, under one pinned algorithm a shape.
+torch::Tensor gemm16(torch::Tensor x16, torch::Tensor w16, double alpha_) {
+    TORCH_CHECK(x16.is_contiguous() && w16.is_contiguous() && x16.scalar_type() == at::kHalf && w16.scalar_type() == at::kHalf,
+                "gemm16: contiguous fp16 rows and weight");
+    const long M = x16.size(0), K = x16.size(1), N = w16.size(0);
+    TORCH_CHECK(w16.size(1) == K, "gemm16: rows of ", K, " inputs against a weight of ", w16.size(1));
+    auto out = torch::empty({M, N}, x16.options());
+    if (M == 0) return out;
+    const auto handle = at::cuda::getCurrentCUDABlasLtHandle();
+    const LtPlan& p = lt_plan(handle, x16.get_device(), N, K, true);
+    const LtLayout rows(CUDA_R_16F, K, M, K), sums(CUDA_R_16F, N, M, N);
+    const float alpha = (float)alpha_, beta = 0.f;
+    LT_CHECK(cublasLtMatmul(handle, p.op, &alpha, w16.data_ptr<at::Half>(), p.weight, x16.data_ptr<at::Half>(), rows.h,
+                            &beta, out.data_ptr<at::Half>(), sums.h, out.data_ptr<at::Half>(), sums.h, &p.algo, nullptr, 0,
+                            at::cuda::getCurrentCUDAStream()));
+    return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("gemm16", &gemm16, "fp16 rows x fp16 (N, K) -> alpha * sums as fp16, one pinned cuBLASLt algorithm a shape");
     m.def("prep", &prep, "bf16 rows -> exact fp16 copies scaled by a power of two, and the scales");
     m.def("prep884", &prep884, "the same in the decode kernel's fragment order [M/8][K/8][8][8]");
     m.def("qmm884", &qmm884, "decode matmul: mma.m8n8k4 from registers, one weight column a thread");

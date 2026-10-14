@@ -15,6 +15,46 @@ Packages: `src/tensorfold/families/gemma4/` and `src/tensorfold/kernels/gemma/v1
 - mlx_lm's step runs about 40 small kernels a layer around the matmuls and takes 14.6 ms synchronous, 13.3
   ms decoded one step ahead.
 
+## Gemma 4 31B (dense) and oMLX oQ / oQe mixed widths
+
+The family also serves the dense layout (`enable_moe_block: false`: 60 layers, hidden 5,376, a GeGLU MLP of
+21,504 a layer, no router or experts) and oMLX oQ/oQe checkpoints, whose `config.json` gives per-layer widths.
+
+- A dense layer runs `attn_tail` (its three norm outputs all the pre-feedforward norm), the stacked gate/up, the
+  down projection and `dense_tail` (post-feedforward norm, residual, layer scalar and the next layer's input norm).
+- `Projection` reads every MLX affine width (2, 3, 4, 5, 6, 8 bits) in groups of 32, 64 or 128: the Nemotron row
+  matvec for 4-bit, `affine_rows` for the others; with `--lane-kernels on` the lane matmul for the widths it reads
+  (4-bit in groups of 32/64, the rest in groups of 64), the row matvec for the rest. Linears of one stack (q/k/v,
+  gate/up) with different widths run one matmul per run of equal ones; none of these kernels changes a row's bits
+  with the row count, so drafted, concurrent and serial replies stay equal.
+- A router at any width (8 bits: the router kernel; else a projection). Routed experts must be 4-bit: `check`
+  refuses any other expert width, and any width, group or mode no kernel reads, naming the tensor.
+- Rows backend: stacked q/k/v and gate/up become views of the stack in mlx_lm's modules, so the stack costs no
+  second copy (31B oQ8e: 31.9 GiB resident). The lane backend keeps a tiled copy (60.8 GiB).
+
+TensorFold-friendly oQe (ai-cluster `nodes/m5/oq_tf_friendly_gemma4.py`, from Google's
+`*-it-qat-q4_0-unquantized` bf16 sources): oQ's enhanced (imatrix) quantization with every tensor in groups of
+64 and q/k/v and gate/up promoted to one width a layer. `gemma-4-26B-A4B-it-qat-oQ4e` (15 GB; 4-bit base, 24 at
+5, 24 at 6, 7 at 8 bits; experts all 4-bit) and `gemma-4-31B-it-qat-oQ8e` (31 GB; uniform 8-bit). Drafters:
+`z-lab/gemma-4-26B-A4B-it-DFlash` and a 31B DFlash model (`target_layer_ids` 1, 12, 23, 35, 46, 57), both at
+`--drafter-bits 8`. The `gemma4_assistant` MTP heads are not read.
+
+Measured on an M5 Ultra (256 GB, MLX 0.32.3), `--parallel 4 --no-thinking`, greedy, 512-token replies, the machine
+shared with other test servers (spread up to about 20% between runs):
+
+| Checkpoint, backend | one-row step | single tok/s | N=2 | N=4 | prefill ~6K |
+| --- | --- | --- | --- | --- | --- |
+| 26B-A4B oQ4e, rows, no drafts | 5.4 ms | 177 | 225 | 286 | 8,700 |
+| 26B-A4B oQ4e, rows + DFlash | | 193 | 250 | 227 | 8,400 |
+| 26B-A4B oQ4e, lane + DFlash | | 187 | 281 | 276 | 8,500 |
+| 31B oQ8e, rows + DFlash | 35.5 ms | 40 (28 undrafted) | 51 | 56 | 1,300 |
+| 31B oQ8e, lane + DFlash | 49.5 ms | 39 | 73 | 83 | 1,300 |
+| 31B oQ8e, lane, no drafts | | 20 | 36 | 62 | 1,290 |
+
+On the 31B the row matvec makes the fastest one-row step and the lane matmul the cheapest wide one (16 rows 58 ms
+against 125 ms), so the lane backend wins once drafts or streams widen the rounds. `--lane-kernels auto` stays on
+the rows backend (half the memory).
+
 ## Drafts
 
 The checkpoint has no draft head, so a stream drafts copies of its context. With `--drafter

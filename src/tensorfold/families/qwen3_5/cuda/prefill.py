@@ -112,6 +112,10 @@ def prefill_chunk(w: Weights, tokens: torch.Tensor, st: State, *, tp: bool = Fal
     W = int(tokens.shape[0])
     if not 0 <= cut < W:
         raise ValueError(f"cut {cut} is not inside a chunk of {W} rows")
+    from . import prefill_overlap
+
+    if prefill_overlap.usable(w, tp, W, cut, vision):      # sums through host memory: two halves, sums beside layers
+        return prefill_overlap.prefill_chunk_overlap(w, tokens, st, capture_taps=capture_taps, last=last, every=every)
     p0 = st.pos
     keep = c.conv_kernel - 1
     dev = tokens.device

@@ -210,6 +210,55 @@ class HostSum(PeerSum):
         _ext().meet(self.sigs, self.rank, 1, self.meets, self.backoff)
         return out
 
+    def shares(self, rows: int) -> list[int]:
+        """Row bounds of each rank's share of a reduce: by ``TF_TP_SUM_SHARES`` weights (a rank with a slower host
+        link may take fewer rows, or none), else even. Any shares give the same bits."""
+
+        raw = os.environ.get("TF_TP_SUM_SHARES", "").strip()
+        weights = [int(x) for x in raw.split(",")] if raw else [1] * self.world
+        if len(weights) != self.world or min(weights) < 0 or not sum(weights):
+            raise ValueError(f"TF_TP_SUM_SHARES: {self.world} non-negative whole weights, not {raw!r}")
+        total, cum, out = sum(weights), 0, [0]
+        for x in weights:
+            cum += x
+            out.append(rows * cum // total)
+        return out
+
+    def reduce(self, local: torch.Tensor) -> torch.Tensor:
+        """``gather``'s rank-ordered fp32 sum rounded once to ``local``'s dtype, the same bits, through a reduce-scatter
+        and an all-gather: each rank copies the rows other ranks reduce into its stage, adds its own share of the rows
+        from every stage in rank order, posts that share in its own stage (no other rank reads those rows of it), and
+        copies the others' shares back."""
+
+        local = local.contiguous()
+        rows, world = local.shape[0], self.world
+        n = local.numel() * local.element_size()
+        view = lambda q: self.host[q][:n].view(local.dtype).view(local.shape)      # noqa: E731
+        bounds = self.shares(rows)
+        a, b = bounds[self.rank], bounds[self.rank + 1]
+        mine_stage = view(self.rank)
+        if a:
+            mine_stage[:a].copy_(local[:a], non_blocking=True)
+        if b < rows:
+            mine_stage[b:].copy_(local[b:], non_blocking=True)
+        _ext().meet(self.sigs, self.rank, 0, self.meets, self.backoff)
+        out = torch.empty_like(local)
+        if b > a:
+            mine = torch.empty((world, b - a, *local.shape[1:]), dtype=local.dtype, device=local.device)
+            for q in range(world):
+                mine[q].copy_(local[a:b] if q == self.rank else view(q)[a:b], non_blocking=True)
+            acc = mine[0].float()
+            for q in range(1, world):
+                acc = acc + mine[q].float()
+            out[a:b] = acc.to(local.dtype)
+            mine_stage[a:b].copy_(out[a:b], non_blocking=True)
+        _ext().meet(self.sigs, self.rank, 1, self.meets, self.backoff)
+        for q in range(world):
+            if q != self.rank and bounds[q + 1] > bounds[q]:
+                out[bounds[q]:bounds[q + 1]].copy_(view(q)[bounds[q]:bounds[q + 1]], non_blocking=True)
+        _ext().meet(self.sigs, self.rank, 0, self.meets, self.backoff)   # no stage is rewritten before all have read
+        return out
+
 
 _PEER: PeerSum | None = None
 
@@ -256,3 +305,17 @@ def install(rank: int, group=None, *, comm=None, stage_bytes: int = STAGE_BYTES)
 
 def peer() -> PeerSum | None:
     return _PEER
+
+
+_SECOND: list = []
+
+
+def second() -> PeerSum | None:
+    """A second host-memory sum (its own stages, flags and rounds) for sums on a second stream beside the first's,
+    made on first use by every rank together (as ``install``); None where the first is not a ``HostSum``."""
+
+    if not isinstance(_PEER, HostSum):
+        return None
+    if not _SECOND:
+        _SECOND.append(HostSum(_PEER.rank, stage_bytes=_PEER.stage_bytes))
+    return _SECOND[0]

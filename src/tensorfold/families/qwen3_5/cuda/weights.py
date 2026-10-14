@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 
-LANE_FORMATS = {(bits, gs) for bits in (4, 5, 6, 8) for gs in (32, 64)}    # (bits, group) the lane kernels read
+from .affine_memory import LANE_FORMATS
 
 
 @dataclass

@@ -482,12 +482,12 @@ def staged_attention(h: np.ndarray, at: int, flat: Sequence[int], width: int, us
 
 
 def staged_fits(streams: Sequence[tuple[Sequence[int], Sequence[int], "State"]], lanes: int, width: int,
-                context: int) -> bool:
-    """Whether a round's windows fit a ``MultiStaged`` of ``width`` rows: at most ``lanes`` streams, chains only (its
-    GDN plan has no slots), and every stream's keys and window within ``context``."""
+                context: int, trees: bool = False) -> bool:
+    """Whether a round's windows fit a ``MultiStaged`` of ``width`` rows: at most ``lanes`` streams, chains only
+    (unless ``trees``: the caller matched the GDN slot class), and every stream's keys and window within ``context``."""
 
     return (1 <= len(streams) <= lanes and sum(len(t) for t, _, _ in streams) <= width
-            and all(st.pos + len(t) <= context and all(int(p) == r - 1 for r, p in enumerate(parents))
+            and all(st.pos + len(t) <= context and (trees or all(int(p) == r - 1 for r, p in enumerate(parents)))
                     for t, parents, st in streams))
 
 
@@ -500,11 +500,13 @@ class MultiStaged:
     path only, so the padding never reaches a real row's bits; ``context`` bounds the committed keys a stream holds.
     """
 
-    def __init__(self, w: Weights, width: int, lanes: int, context: int, pad_rec: torch.Tensor) -> None:
+    def __init__(self, w: Weights, width: int, lanes: int, context: int, pad_rec: torch.Tensor, *,
+                 slots: int = 0) -> None:
         from tensorfold.cuda.build import volta
 
         c, device = w.config, w.norm.device
         self.w, self.width, self.lanes, self.context = w, width, lanes, context
+        self.slot_class = slots                      # the GDN kernel's slot class (0: chains): trees replay theirs
         self.keep, self.group = c.conv_kernel - 1, c.heads // c.kv_heads
         self.linear = [i for i, layer in enumerate(w.layers) if layer.linear]
         self.softmax = [i for i, layer in enumerate(w.layers) if not layer.linear]
@@ -567,15 +569,17 @@ class MultiStaged:
         torch._foreach_copy_(dst, src)
         return starts[:len(real) + 1]
 
-    def forward(self, *, full_logits: bool = True):
-        """The staged forward (what a graph captures): (logits, record, h) for all ``width`` rows."""
+    def forward(self, *, full_logits: bool = True, tp: bool = False, capture_taps: bool = False):
+        """The staged forward (what a graph captures): (logits, record, h) for all ``width`` rows; with
+        ``capture_taps``: (logits, record, taps, h). ``tp``: row-parallel sums across the ranks."""
 
         W, S = self.width, self.slots
-        pos, sid_t, plan, ids_t, windows_t, aplan = _multi_unpack(self.dev, W, S, self.keep, 0, W, self.n_items,
-                                                                  self.chunks, self.tile)
-        logits, record, _, h = _multi_layers(self.w, W, ids_t, pos, sid_t, plan, windows_t, aplan, self.aoffs,
-                                             self.tables, self.conv.__getitem__, full_logits=full_logits)
-        return logits, record, h
+        pos, sid_t, plan, ids_t, windows_t, aplan = _multi_unpack(self.dev, W, S, self.keep, self.slot_class, W,
+                                                                  self.n_items, self.chunks, self.tile)
+        logits, record, taps, h = _multi_layers(self.w, W, ids_t, pos, sid_t, plan, windows_t, aplan, self.aoffs,
+                                                self.tables, self.conv.__getitem__, full_logits=full_logits, tp=tp,
+                                                capture_taps=capture_taps)
+        return (logits, record, taps, h) if capture_taps else (logits, record, h)
 
 
 class _Pad:

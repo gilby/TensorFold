@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 from typing import Callable, Sequence
 
+import os
+
 from tensorfold.cuda import prompt_precision
 from tensorfold.cuda.build import VOLTA, volta
 
@@ -73,8 +75,11 @@ class Qwen27Engine:
         keep = KEEP if keep is None else int(keep)         # --checkpoint-slots: each kept state is in the estimate
         from .tree_graphs import enabled as tree_graphs_enabled
 
-        # tree verify graphs: no EXL3 weights; on sm_70 only one stream on several ranks (where the host bounds a round)
-        trees_on = tree_graphs_enabled() and not exl3 and (not volta() or (tp > 1 and streams == 1))
+        # tree verify graphs: no EXL3 weights; on sm_70 several ranks only (where the host bounds a round): a lone
+        # stream's rounds, and with --parallel several streams' rounds too (RoundGraphs, TF_ROUND_GRAPHS)
+        trees_on = tree_graphs_enabled() and not exl3 and (not volta() or tp > 1)
+        round_graphs = os.environ.get("TF_ROUND_GRAPHS", "1")
+        rounds_on = trees_on and volta() and tp > 1 and streams > 1 and round_graphs != "0"
         if tp > 1:
             import torch.distributed as dist
 
@@ -84,7 +89,8 @@ class Qwen27Engine:
             # both ranks must run the same calls: refuse to start when they were given different settings
             flags = torch.tensor([int(draft_dir is not None and tp_draft), max_rows, int(split_head), int(allow_copy),
                                   streams, -1 if context is None else int(context), int(bool(context_explicit)),
-                                  int(vision), keep, int(trees_on), bits, int(prompt_precision.fp8())],   # precision last
+                                  int(vision), keep, int(trees_on), int(rounds_on) + int(round_graphs == "force"),
+                                  bits, int(prompt_precision.fp8())],   # precision last
                                  dtype=torch.int64, device="cuda")
             both = torch.empty((tp, flags.numel()), dtype=torch.int64, device="cuda")
             dist.all_gather_into_tensor(both, flags)
@@ -96,7 +102,7 @@ class Qwen27Engine:
                                    f"head split, copies, --parallel, --context, --checkpoint-slots): rank 0 "
                                    f"{both[0].tolist()}, rank {odd} {both[odd].tolist()}; pull the draft model "
                                    "everywhere, and pass the same --no-drafts, --parallel, --context, "
-                                   "--checkpoint-slots, --kv-dtype and TF_TREE_GRAPHS to every rank")
+                                   "--checkpoint-slots, --kv-dtype, TF_TREE_GRAPHS and TF_ROUND_GRAPHS to every rank")
             gather = lambda values: gather_ints(torch, lambda send, recv: dist.all_gather_into_tensor(recv, send), values,
                                                 tp)
             from tensorfold.cuda import p2p
@@ -178,8 +184,6 @@ class Qwen27Engine:
             self.w.tap_layers = full.tap_layers = self.draft.taps
         # one stream with a chain drafter (DSpark): the draft step and the target's chain verify replay CUDA graphs
         self.chain = None
-        import os
-
         if (self.draft is not None and hasattr(self.draft, "graph_chain") and tp == 1 and streams == 1
                 and os.environ.get("TF_DRAFT_GRAPHS", "1") != "0"):
             from .chain_graphs import ChainGraphs
@@ -233,15 +237,30 @@ class Qwen27Engine:
                 from .chain_graphs import ChainGraphs
 
                 self.multi.chain = ChainGraphs(self.w, self.context_window + 32)     # a lone stream's rounds
-            if (trees_on and not volta() and drafting and not hasattr(self.draft, "graph_chain")
+            if (trees_on and drafting and not hasattr(self.draft, "graph_chain")
                     and (self.multi.drafts or tp > 1)):
                 from .tree_graphs import MultiGraphs, TreeGraphs
 
-                # a lone drafting stream's rounds replay CUDA graphs; several streams' too on two ranks only
-                kind = MultiGraphs if tp > 1 else TreeGraphs
+                # a lone drafting stream's rounds replay CUDA graphs; several streams' too on two ranks (MultiGraphs:
+                # each window padded to the same rows) and on sm_70 ranks (RoundGraphs: rows padded once, by width)
+                kind = MultiGraphs if tp > 1 and not volta() else TreeGraphs
+                log = (lambda line: print(line, flush=True)) if rank == 0 else None
                 self.multi.trees = kind(self.w, tp=tp > 1, taps=self.multi.drafts,
-                                        full_logits=self.multi.split or rank == 0,
-                                        log=(lambda line: print(line, flush=True)) if rank == 0 else None)
+                                        full_logits=self.multi.split or rank == 0, log=log)
+                if rounds_on:
+                    from .forward import State
+                    from .round_graphs import RoundGraphs
+
+                    together = RoundGraphs(self.w, streams, self.capacity_plan["cache_slots"] + max_rows + 2,
+                                           tp=True, taps=self.multi.drafts, full_logits=self.multi.split or rank == 0,
+                                           log=log)
+                    st = State(self.w)
+                    together.capture_all(st)
+                    if round_graphs != "force":       # a width whose replay is not faster stays eager (not kept)
+                        together.calibrate(st, rank, tp)
+                        together = together.trimmed(st)
+                    self.multi.together = together
+                    del st
                 if hasattr(self.draft, "graph_block"):
                     self.draft.graphs_on = True
             self.multi.calibrate(streams)

@@ -244,9 +244,7 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     from tensorfold import hub
 
     if args.tp > 1 and not args.master:
-        raise ValueError("--tp 2/4 needs --master: rank 0's address on the link between the ranks")
-    if args.tp == 1 and args.rank != 0:
-        raise ValueError("--rank 1 needs --tp 2 or 4")
+        raise ValueError(f"--tp {args.tp} needs --master: rank 0's address on the link between the ranks")
     if args.rank >= args.tp:
         raise ValueError(f"--rank {args.rank} needs --tp {args.rank + 1} or more")
     if args.tp == 4 and not getattr(family.package, "CUDA_TP4", False):
@@ -295,7 +293,8 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
                          "other than Qwen's 4-bit g64, Flash Next without MXFP8 layers); drop the flag")
     stacks.arm()            # its warmup may have loaded a compiler that took USR1
     if args.tp > 1 and args.rank != 0:
-        print(f"[tensorfold] rank {args.rank} ready in {time.perf_counter() - started:.1f}s, following rank 0", flush=True)
+        print(f"[tensorfold] rank {args.rank} ready in {time.perf_counter() - started:.1f}s, following rank 0",
+              flush=True)
         engine.follow()
         return 0
     from tensorfold.cuda.server import App, serve

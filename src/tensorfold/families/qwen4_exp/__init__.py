@@ -14,6 +14,7 @@ MODELS = ("TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP", "turboderp/Qwen3.8-Flash
 NVFP4_MODELS = MODELS[2:]
 QUANT_METHODS = {"cuda": ("mlx", "exl3", "modelopt")}  # MLX affine 4-bit, EXL3 packs and NVFP4 (ModelOpt)
 EXL3_VARIANT = "any"                           # every EXL3 codebook and width (tensorfold.families.EXL3_VARIANT_ANY)
+CUDA_TP4 = True                                # --tp 4: the CUDA engine splits over four ranks
 KERNEL_PACKAGE = "tensorfold.kernels.qwen.flash_next.v1"
 KERNEL_VERSION = "v1"
 # The CLI sets defaults before MLX starts so expert bindings do not end each command buffer.

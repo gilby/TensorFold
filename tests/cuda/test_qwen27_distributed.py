@@ -155,15 +155,15 @@ def test_cuda_partial_is_row_invariant_and_accurate(n, k):
     assert (full - ref).abs().max().item() <= ref.abs().max().item() * 2**-7
 
 
-def _nccl_worker(rank: int, port: int):
+def _nccl_worker(rank: int, port: int, world: int = 2):
     import torch.distributed as dist
 
     torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2)
+    dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world)
     try:
         local = torch.full((16, 128), rank + 0.25, dtype=torch.float32, device=f"cuda:{rank}")
         got = gather_rank_partials(local)
-        expected = torch.full_like(got, 1.5)
+        expected = torch.full_like(got, sum(r + 0.25 for r in range(world)))
         assert torch.equal(got, expected)
     finally:
         dist.destroy_process_group()
@@ -203,17 +203,24 @@ def test_two_process_nccl_rank_order():
     spawn(_nccl_worker, args=(port,), nprocs=2)
 
 
-def _p2p_worker(rank: int, port: int, host: bool = False):
+def _p2p_worker(rank: int, port: int, host: bool = False, world: int = 2):
     import torch.distributed as dist
 
     from tensorfold.cuda import p2p
 
     torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2)
+    dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world)
     try:
         if host:                                  # the GPUs cannot map each other: shared page-locked host memory
-            assert p2p.install(rank), "both ranks are on this machine, yet the host-memory sum was not installed"
+            assert p2p.install(rank, stage_bytes=24 << 20), "all ranks are on this machine, yet no host-memory sum"
             assert isinstance(p2p.peer(), p2p.HostSum)
+            peer = p2p.peer()
+            gen = torch.Generator(device="cuda").manual_seed(7 + rank)
+            for rows in (2048, 300, 2048, 1):     # prompt-sized partials go by copies: the gathered bytes exactly
+                local = torch.randn((rows, 2560), generator=gen, device="cuda")
+                want = torch.empty((world * rows, 2560), device="cuda")
+                dist.all_gather_into_tensor(want, local)
+                assert torch.equal(peer.gather(local).view(-1, 2560), want), f"gather of {rows} rows"
         else:
             assert p2p.install(rank), "both GPUs can map each other, yet the P2P sum was not installed"
         peer = p2p.peer()
@@ -222,10 +229,13 @@ def _p2p_worker(rank: int, port: int, host: bool = False):
             rows = (1, 3, 16, 64, 128)[round_ % 5]
             dtype = torch.float32 if round_ % 3 else torch.bfloat16
             local = (torch.randn((rows, 5120), generator=gen, device="cuda") * 3).to(dtype)
-            both = torch.empty((2 * rows, 5120), dtype=dtype, device="cuda")
-            dist.all_gather_into_tensor(both, local)
-            want = (both[:rows].float() + both[rows:].float()).to(torch.bfloat16)
-            got = peer(local)
+            every = torch.empty((world * rows, 5120), dtype=dtype, device="cuda").view(world, rows, 5120)
+            dist.all_gather_into_tensor(every.view(-1, 5120), local)
+            acc = every[0].float()
+            for r in range(1, world):
+                acc = acc + every[r].float()
+            want = acc.to(torch.bfloat16)
+            got = gather_rank_partials(local)     # the kernel for decode rows, copies through host memory above
             assert torch.equal(got, want), f"round {round_}: P2P sum differs from the rank-ordered sum"
         torch.cuda.synchronize()
     finally:
@@ -261,3 +271,88 @@ def test_two_process_host_memory_sum_is_the_rank_ordered_sum():
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     spawn(_p2p_worker, args=(port, True), nprocs=2)
+
+
+def _spawn(fn, world: int, *args) -> None:
+    from torch.multiprocessing import spawn
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    spawn(fn, args=(port, *args), nprocs=world)
+
+
+def test_four_process_nccl_rank_order():
+    if os.environ.get("TENSORFOLD_TEST_NCCL") != "1":
+        pytest.skip("set TENSORFOLD_TEST_NCCL=1 to run the NCCL process test")
+    if torch.cuda.device_count() < 4:
+        pytest.skip("requires four visible CUDA devices")
+    _spawn(_nccl_worker, 4, 4)
+
+
+def test_four_process_host_memory_sum_is_the_rank_ordered_sum():
+    """Four ranks without peer mappings: the host-memory sum adds the four partials in rank order, one rounding."""
+
+    if os.environ.get("TENSORFOLD_TEST_NCCL") != "1":
+        pytest.skip("set TENSORFOLD_TEST_NCCL=1 to run the four-GPU process tests")
+    if torch.cuda.device_count() < 4 or torch.cuda.can_device_access_peer(0, 1):
+        pytest.skip("requires four visible CUDA devices that cannot map each other")
+    _spawn(_p2p_worker, 4, True, 4)
+
+
+def _graph_worker(rank: int, port: int, world: int):
+    import torch.distributed as dist
+
+    from tensorfold.cuda import p2p
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world)
+    try:
+        assert p2p.install(rank)
+        peer = p2p.peer()
+        gen = torch.Generator(device="cuda").manual_seed(500 + rank)
+        local = torch.empty((12, 5120), device="cuda")
+        out: list = []
+
+        def sums():
+            out.clear()
+            out.extend(peer(local) for _ in range(3))
+            return out
+
+        sums()
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        peer.begin_capture()
+        with torch.cuda.graph(g):
+            captured = sums()
+        assert peer.end_capture() == 3
+        for step in range(30):                          # replays among eager sums: every round new on every rank
+            local.copy_(torch.randn((12, 5120), generator=gen, device="cuda") * 3)
+            every = torch.empty((world * 12, 5120), device="cuda")
+            dist.all_gather_into_tensor(every, local)
+            acc = every[:12].clone()
+            for r in range(1, world):
+                acc = acc + every[12 * r:12 * (r + 1)]
+            want = acc.to(torch.bfloat16)
+            if step % 3 == 0:
+                got = [peer(local)]
+            else:
+                peer.before_replay(3)
+                g.replay()
+                got = captured
+            for t in got:
+                assert torch.equal(t, want), f"step {step}: the sum differs from the rank-ordered sum"
+        torch.cuda.synchronize()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world", [2, 4])
+def test_captured_sums_replay_with_new_rounds(world):
+    """Sums captured in a graph and replayed among eager ones equal the rank-ordered sum, whatever the transport."""
+
+    if os.environ.get("TENSORFOLD_TEST_NCCL") != "1":
+        pytest.skip("set TENSORFOLD_TEST_NCCL=1 to run the multi-GPU process tests")
+    if torch.cuda.device_count() < world:
+        pytest.skip(f"requires {world} visible CUDA devices")
+    _spawn(_graph_worker, world, world)

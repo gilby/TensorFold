@@ -14,6 +14,7 @@ MODELS = ("TensorFold/Qwen3.8-27B-MLX-4bit", "turboderp/Qwen3.8-27B-exl3", "nvid
 DRAFTER = "z-lab/Qwen3.8-27B-DFlash2"
 QUANT_METHODS = {"cuda": ("mlx", "exl3", "modelopt", "compressed-tensors")}   # MLX affine, EXL3, NVFP4 / FP8
 EXL3_VARIANT = "any"                           # every EXL3 codebook and width (tensorfold.families.EXL3_VARIANT_ANY)
+CUDA_TP4 = True                                # --tp 4: the CUDA engine splits over four ranks
 KERNEL_PACKAGE = "tensorfold.kernels.qwen.dense.v1"
 KERNEL_VERSION = "v1"
 
@@ -303,7 +304,7 @@ def gb10() -> bool:
 
 def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
                 master_port: int = 29551, no_drafts: bool = False, **options: Any):
-    """The CUDA engine for ``tensorfold serve``; tp=2 adds fp32 partials in rank order and needs the drafter on both."""
+    """The CUDA engine for ``tensorfold serve``; tp=2 or 4 adds fp32 partials in rank order (tp=2 drafts on both ranks)."""
 
     from .cuda.engine import Qwen27Engine
     from .cuda.exl3_load import quant_config
@@ -321,7 +322,7 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
     wide = tp == 1 and streams == 1 and gb10()
     return Qwen27Engine(Path(model_dir), draft, max_rows=128 if wide else 12, tree_rows=16 if wide else None,
                         tp=tp, rank=rank, master=master, port=master_port,
-                        split_head=tp == 2, tp_draft=tp == 2 and draft is not None, allow_copy=not no_drafts,
+                        split_head=tp > 1, tp_draft=tp == 2 and draft is not None, allow_copy=not no_drafts,
                         streams=streams, context=options.get("context"),
                         context_explicit=options.get("context_explicit"), vision=bool(options.get("vision", False)),
                         vision_urls=bool(options.get("vision_urls", False)),

@@ -291,7 +291,8 @@ __global__ void gather_rows_kernel(const long* __restrict__ ids, const uint4* __
 constexpr int EX_ROWS = 8;           // pairs an item
 
 // Pairs grouped by expert (one block): members[] pair ids, expert by expert; items (expert, first, count).
-// The order of pairs inside an expert's run never changes a pair's bits.
+// The order of pairs inside an expert's run never changes a pair's bits; a pick of ``experts`` or more (an expert run
+// elsewhere, e.g. a 16-bit shared one) is left out.
 __global__ void plan_kernel(const int* __restrict__ picks, int pairs, int experts, int* __restrict__ members,
                             int* __restrict__ items, int* __restrict__ counts) {
     extern __shared__ int sh[];
@@ -301,7 +302,8 @@ __global__ void plan_kernel(const int* __restrict__ picks, int pairs, int expert
     int* fill = sh + 3 * experts;
     for (int e = threadIdx.x; e < experts; e += blockDim.x) { hist[e] = 0; fill[e] = 0; }
     __syncthreads();
-    for (int p = threadIdx.x; p < pairs; p += blockDim.x) atomicAdd(hist + picks[p], 1);
+    for (int p = threadIdx.x; p < pairs; p += blockDim.x)
+        if (picks[p] < experts) atomicAdd(hist + picks[p], 1);
     __syncthreads();
     if (threadIdx.x == 0) {
         int o = 0, io = 0;
@@ -315,7 +317,7 @@ __global__ void plan_kernel(const int* __restrict__ picks, int pairs, int expert
     __syncthreads();
     for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
         const int e = picks[p];
-        members[offs[e] + atomicAdd(fill + e, 1)] = p;
+        if (e < experts) members[offs[e] + atomicAdd(fill + e, 1)] = p;
     }
     for (int e = threadIdx.x; e < experts; e += blockDim.x)
         for (int j = 0; j * EX_ROWS < hist[e]; ++j) {

@@ -130,11 +130,11 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
     cuda.add_argument("--backend", choices=("auto", "mlx", "cuda"), default="auto",
                       help="auto: MLX on macOS, CUDA elsewhere")
     cuda.add_argument("--tp", type=int, choices=(1, 2, 4), default=1,
-                      help="GPUs (one per machine) the model is split over; run the same command on each")
+                      help="GPUs the model is split over (one process each); run the same command for each rank")
     cuda.add_argument("--rank", type=int, choices=(0, 1, 2, 3), default=0,
-                      help="with --tp 2/4: this machine's rank; rank 0 serves HTTP, others follow it")
-    cuda.add_argument("--master", default="", help="with --tp 2/4: rank 0's address on the link between the ranks")
-    cuda.add_argument("--master-port", type=int, default=29551, help="with --tp 2/4: rank 0's rendezvous port")
+                      help="with --tp 2 or 4: this process's rank; rank 0 serves HTTP, the others follow it")
+    cuda.add_argument("--master", default="", help="with --tp 2 or 4: rank 0's address on the link between ranks")
+    cuda.add_argument("--master-port", type=int, default=29551, help="with --tp 2 or 4: rank 0's rendezvous port")
     cuda.add_argument("--device", type=int, default=None,
                       help="CUDA device index this rank runs on (default 0); two ranks on one machine: --device 0 and "
                            "--device 1 with both GPUs visible, so NCCL maps the peer over NVLink")

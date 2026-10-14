@@ -219,7 +219,7 @@ def test_generic_memory_counts_eight_bit_words_without_four_bit_padding(tmp_path
 
 def test_mixed_prefill_tiles_raw_fast_weights_and_preserves_fp8_dispatch():
     tree = ast.parse((ROOT / "families/qwen3_5/cuda/prefill.py").read_text())
-    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_mm")
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_mm_base")
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
     seen = []
     def tile(weight):
@@ -240,6 +240,7 @@ def test_mixed_prefill_tiles_raw_fast_weights_and_preserves_fp8_dispatch():
                  "QLinear": QLinear}
     module = ast.fix_missing_locations(ast.Module(body=[future, function], type_ignores=[]))
     exec(compile(module, "mixed_prefill_dispatch", "exec"), namespace)
+    namespace["_mm"] = namespace["_mm_base"]          # the dispatch, without an adapter's term
     rows = SimpleNamespace(shape=(4096, 256))
     four = QLinear(fast=True, layout="mlx", bits=4)
     other = QLinear(fast=False, layout="mlx", bits=8)

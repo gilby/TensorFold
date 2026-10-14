@@ -9,6 +9,7 @@ import mlx.core as mx
 from tensorfold.families.glm5_next import config as C
 from tensorfold.families.glm5_next.config import Config, row_kernel
 from tensorfold.families.glm5_next.linear import ChunkQueue, Q, kernel_q, per_row, project, silu
+from tensorfold.families.glm5_next import linear as L
 from tensorfold.kernels.glm.flash.v1 import moe as MK
 from tensorfold.kernels.glm.flash.v1 import kernels as K
 from tensorfold.kernels.glm.flash.v1 import prompt as PK
@@ -183,6 +184,9 @@ class MoE:
             return stream.moe(self, x, rows_exact)
         rows = int(x.shape[0])
         if rows_exact and "moe" in C.FUSED and self.fused_ok and K.metal() and x.dtype == mx.bfloat16:
+            if self.shared is not None and (L.on_matrix(self.shared.gate_up) or L.on_matrix(self.shared.down)):
+                # the shared expert through project (the matrix kernel its shapes take), the routed experts fused
+                return MK.moe_rows(self, x, shared_out=self.shared(x, True))
             return MK.moe_rows(self, x)
         if row_kernel("experts", rows, rows_exact):
             idx, w = self.route(self.logits(x, True))

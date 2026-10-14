@@ -173,12 +173,14 @@ class Qwen27Engine:
             print(f"[tensorfold] {self.kv_dtype} KV cache (fp16 scale per 32 values): "
                   f"{self.context_window} tokens a window", flush=True)
         self.draft = None
-        if draft_dir is not None and (rank == 0 or (tp == 2 and tp_draft)):
+        if draft_dir is not None and (rank == 0 or (tp > 1 and tp_draft)):
             from .dflash1 import drafter_class
 
-            # tp_draft: both ranks hold half the drafter and draft together (rank 1 needs --draft too)
+            # tp_draft: every rank holds its share of the drafter and they draft together (each needs --draft)
             kind = drafter_class(draft_dir)
-            self.draft = kind(draft_dir, full, rank=rank, world=2) if tp == 2 and tp_draft else kind(draft_dir, full)
+            self.draft = kind(draft_dir, full, rank=rank, world=tp) if tp > 1 and tp_draft else kind(draft_dir, full)
+            if tp > 1 and not tp_draft and hasattr(self.draft, "own_head"):
+                self.draft.own_head()           # rank 0 alone drafts: the whole target head it was given goes
             if len(self.draft.taps) and max(self.draft.taps) >= full.config.layers:
                 raise ValueError(f"the drafter reads target layers {self.draft.taps}; this model has {full.config.layers}")
             self.w.tap_layers = full.tap_layers = self.draft.taps

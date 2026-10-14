@@ -146,7 +146,7 @@ class MultiDecoder:
         cuda = torch.device(self.device).type == "cuda"     # a CPU stand-in on a GPU machine runs as on a host box
         self.depth = cuda and tuple(torch.cuda.get_device_capability(self.device)) in DEPTH_CHIPS
         self.split = world > 1 and world * w.head.n == w.config.vocab    # each rank holds its share of the head
-        self.drafts = draft is not None and (rank == 0 or getattr(draft, "world", 1) == 2)
+        self.drafts = draft is not None and (rank == 0 or getattr(draft, "world", 1) > 1)
         self.streams: dict[int, Stream] = {}                  # decoding
         self.filling: list[Stream] = []                        # admitted, prompts still prefilling (oldest first)
         self.points = points                                  # a prompt's message starts to keep states at, or None

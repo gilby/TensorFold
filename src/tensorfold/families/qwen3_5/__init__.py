@@ -329,7 +329,8 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
     wide = tp == 1 and streams == 1 and gb10()
     return Qwen27Engine(Path(model_dir), draft, max_rows=128 if wide else 12, tree_rows=16 if wide else None,
                         tp=tp, rank=rank, master=master, port=master_port,
-                        split_head=tp > 1, tp_draft=tp == 2 and draft is not None, allow_copy=not no_drafts,
+                        split_head=tp > 1, tp_draft=draft is not None and (tp == 2 or (
+                            tp == 4 and os.environ.get("TF_TP_DRAFT", "1") != "0")), allow_copy=not no_drafts,
                         streams=streams, context=options.get("context"),
                         context_explicit=options.get("context_explicit"), vision=bool(options.get("vision", False)),
                         vision_urls=bool(options.get("vision_urls", False)),

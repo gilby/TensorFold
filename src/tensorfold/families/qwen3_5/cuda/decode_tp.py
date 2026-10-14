@@ -165,7 +165,7 @@ def prefill_tp(w: Weights, prompt: Sequence[int], sampling: Sampling | None, ran
     st = clone_state(state) if state is not None else State(w)
     if state is None:
         st.limit = limit                    # a fresh state's attention caches stop here; a resumed one keeps its own
-    taps = draft is not None and (rank == 0 or getattr(draft, "world", 1) == 2)
+    taps = draft is not None and (rank == 0 or getattr(draft, "world", 1) > 1)
     out = prefill_stops(w, prompt, st, draft if taps else None, stops=stops, keep=keep, tp=True, keep_at=keep_at,
                         vision=vision)
     first = first_token(w, out if keep_at is None else out[0], len(prompt), sampling, rank, _world(), constraint)
@@ -207,7 +207,7 @@ def decode_tp(w: Weights, st: State, prompt: Sequence[int], pending: int, count:
     context = list(prompt) + out
     committed: list[int] = []
     copies = CopyIndex() if allow_copy and rank == 0 else None
-    tp_draft = draft is not None and getattr(draft, "world", 1) == 2
+    tp_draft = draft is not None and getattr(draft, "world", 1) > 1
     last, length = pending, len(context)      # rank 1's view of the pending token and context length
     stages = dict(draft=0.0, verify=0.0, sample=0.0, commit=0.0)
     rounds = drafted_rows = accepted = 0

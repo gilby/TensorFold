@@ -108,8 +108,8 @@ class FlashNextEngine:
         if (exl3 or (nvfp4 and not sm70)) and tp != 1:
             raise ValueError(f"{'EXL3 packs' if exl3 else 'NVFP4 checkpoints'} of Flash Next run on one GPU here: drop "
                              "--tp, or serve the MLX checkpoint (TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP) on two")
-        if vision and (streams < 2 or tp != 1):
-            raise ValueError("image input on Flash Next runs on one GPU with --parallel 2 or more")
+        if vision and tp > 2:
+            raise ValueError("image input on Flash Next runs on one GPU or two ranks")
         if exl3 and ple_on_ssd:
             raise ValueError("--ple-on-ssd reads the MLX checkpoint's n-gram tables; an EXL3 pack maps its own table "
                              "from its file, so drop --ple-on-ssd")
@@ -126,9 +126,6 @@ class FlashNextEngine:
 
         if tp not in (1, 2, 4) or rank not in range(tp):
             raise ValueError(f"rank {rank} of {tp}: Flash Next runs on one GPU, two ranks or four")
-        if streams > 1 and tp > 1:
-            raise ValueError(f"--parallel decodes several Flash Next requests together on one GPU; with --tp {tp} it "
-                             "serves one request at a time for now, so drop --parallel")
         if not 0 <= int(depth) <= MAX_DEPTH:
             raise ValueError(f"MTP drafts a round: 0 to {MAX_DEPTH}, not {depth}")
         if not 0.0 <= float(confidence) <= 1.0:
@@ -221,7 +218,7 @@ class FlashNextEngine:
         if vision and rank == 0:
             from tensorfold.vision.qwen_cuda import QwenCudaVision
 
-            self.vision = QwenCudaVision(model_dir, torch.device("cuda", 0),
+            self.vision = QwenCudaVision(model_dir, torch.device("cuda", torch.cuda.current_device()),
                                          allow_urls=vision_urls)
             torch.cuda.empty_cache()
             ranks = "; rank 1 receives each request's image features from this rank" if tp == 2 else ""

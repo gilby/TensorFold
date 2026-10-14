@@ -33,7 +33,7 @@ def exchange(comm, rank: int, length: int, images: dict, encoded=None, *, hidden
             raise ValueError("the image features rank 0 encoded do not match what it told rank 1")
         swap(comm, [features, positions], [features.new_empty((0,)), positions.new_empty((0,))], 1)
         return EncodedVision(tuple(rows), features, positions, delta)
-    device = torch.device("cuda", 0)
+    device = torch.device("cuda", torch.cuda.current_device())
     features = torch.empty(shape, dtype=torch.bfloat16, device=device)
     positions = torch.empty((3, length), dtype=torch.int32, device=device)
     swap(comm, [features.new_empty((0,)), positions.new_empty((0,))], [features, positions], 0)

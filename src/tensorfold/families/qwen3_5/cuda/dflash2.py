@@ -239,7 +239,7 @@ class DFlash2:
                          (torch.arange(self.head_dim // 2, device=self.device,
                                        dtype=torch.float32) * 2 / self.head_dim))
         self._head(target, rank, world)
-        if isinstance(target.head, QLinear) and target.head.layout == "tiled" and self.sub_rows is None:
+        if isinstance(target.head, QLinear) and target.head.layout in ("tiled", "volta") and self.sub_rows is None:
             self.sub_head = tile(self.sub_head)
         self._weights(fast, bits, rank, world)
 
@@ -282,8 +282,6 @@ class DFlash2:
             self.sub_head = QLinear(*[None if t is None else t[lo:hi].contiguous()
                                       for t in (sub.weight, sub.scales, sub.biases)],
                                     layout=sub.layout, gs=sub.gs, bits=sub.bits)
-        if isinstance(target.head, QLinear) and target.head.layout in ("tiled", "volta") and self.sub_rows is None:
-            self.sub_head = tile(self.sub_head)
 
     def own_head(self) -> None:
         """The draft vocabulary's head rows as this drafter's own copies (an sm_70 head's tile views too:

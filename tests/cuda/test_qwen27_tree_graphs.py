@@ -20,6 +20,7 @@ from tensorfold.families.qwen3_5.cuda.forward import multi_tree_forward  # noqa:
 from tensorfold.families.qwen3_5.cuda.tree_graphs import (MultiGraphs, TreeGraphs, rows_bucket, slot_class,  # noqa: E402
                                                           tree_decode)
 from tensorfold.families.qwen3_5.cuda.weights import GDN, Attention, Config, Layer, Plain, QLinear, Weights  # noqa: E402
+from tensorfold.cuda.kernels import attention as tree_attention  # noqa: E402
 from tensorfold.cuda.kernels import gdn as deltanet  # noqa: E402
 
 CONFIG = Config(hidden=128, intermediate=256, layers=2, heads=2, kv_heads=2, head_dim=128, vocab=256, k_heads=2,
@@ -134,6 +135,23 @@ def test_replay_equals_eager_for_every_shape(model, prompt_len):
                                  capture_taps=True)
             _same(eager, runner.verify(view, toks, parents), len(parents))
     assert runner.captures == len({(rows_bucket(len(p)), slot_class(deltanet.schedule(p)[1])) for p in SHAPES})
+
+
+@pytest.mark.parametrize("policy", [0, None], ids=["fold-in-kernel", "default"])
+def test_replay_equals_eager_past_whole_key_groups(model, policy, monkeypatch):
+    """9,000 committed keys, four whole key groups: replays equal eager windows whichever groups fold in a program."""
+
+    if policy is not None:
+        monkeypatch.setattr(tree_attention, "MIN_GROUPED", policy)
+    w = model
+    st = State(w)
+    prefill_state(w, _tokens(9000, 3), st)
+    runner = TreeGraphs(w)
+    view = runner.load(st)
+    for k, parents in enumerate(SHAPES):
+        toks = _tokens(len(parents), 5 * k)
+        eager = tree_forward(w, torch.tensor(toks, device="cuda", dtype=torch.int32), parents, st, capture_taps=True)
+        _same(eager, runner.verify(view, toks, parents), len(parents))
 
 
 def test_graph_commits_equal_eager_commits(model):
@@ -373,16 +391,17 @@ def _two_gpu_worker(rank: int, port: int):
         # the two-rank tree verify: graph replay against eager, both ranks
         w = split_weights(_nvfp4_model(), rank, tiled=True, split_head=True)
         w.tap_layers = (0, 1)
-        st = State(w)
-        prefill_state(w, _tokens(505, 4), st, tp=True)
-        runner = TreeGraphs(w, tp=True)
-        view = runner.load(st)
-        for rep in range(2):
-            for k, parents in enumerate(SHAPES):
-                toks = _tokens(len(parents), 11 * k + rep)
-                eager = tree_forward(w, torch.tensor(toks, device="cuda", dtype=torch.int32), parents, st, tp=True,
-                                     capture_taps=True)
-                _same(eager, runner.verify(view, toks, parents), len(parents))
+        for n in (505, 9000):                           # 9,000: whole key groups fold in the tree attention
+            st = State(w)
+            prefill_state(w, _tokens(n, 4), st, tp=True)
+            runner = TreeGraphs(w, tp=True)
+            view = runner.load(st)
+            for rep in range(2):
+                for k, parents in enumerate(SHAPES):
+                    toks = _tokens(len(parents), 11 * k + rep)
+                    eager = tree_forward(w, torch.tensor(toks, device="cuda", dtype=torch.int32), parents, st,
+                                         tp=True, capture_taps=True)
+                    _same(eager, runner.verify(view, toks, parents), len(parents))
         other = State(w)                                # several streams in one two-rank graph against eager
         prefill_state(w, _tokens(40, 5), other, tp=True)
         multi = MultiGraphs(w, tp=True)

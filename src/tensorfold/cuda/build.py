@@ -77,8 +77,8 @@ def refuse_old_gpu(need: tuple[int, int] = MIN_CAPABILITY) -> None:
             raise ValueError(str(exc)) from None
 
 
-def refuse_small_gpu(need: tuple[int, int] = FLASHNEXT_FLOOR) -> None:
-    """At startup, before any weight loads: a GPU below Flash Next's CUDA floor is refused by name (no GPU: skipped)."""
+def refuse_small_gpu(need: tuple[int, int] = FLASHNEXT_FLOOR, also: tuple[tuple[int, int], ...] = ()) -> None:
+    """At startup, before any weight loads: a GPU below Flash Next's CUDA floor, and not in ``also``, is refused by name."""
 
     try:
         import torch
@@ -86,7 +86,7 @@ def refuse_small_gpu(need: tuple[int, int] = FLASHNEXT_FLOOR) -> None:
         return
     if torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability()
-        if (major, minor) < need:
+        if (major, minor) < need and (major, minor) not in also:
             raise ValueError("TensorFold's Flash Next CUDA kernels run on sm_120 and sm_121 GPUs only "
                              "(DGX Spark GB10, RTX 50 and RTX PRO 6000); this GPU "
                              f"({torch.cuda.get_device_name()}) is {major}.{minor}. Serve Flash Next on CUDA on one "

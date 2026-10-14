@@ -31,7 +31,7 @@ class Qwen27Engine:
                  tp_draft: bool = False, allow_copy: bool = True, streams: int = 1,
                  context: int | None = None, context_explicit: bool | None = None, vision: bool = False,
                  vision_urls: bool = False, vision_offload: bool = False, tree_rows: int | None = None,
-                 keep: int | None = None, loader=None):
+                 keep: int | None = None, loader=None, kv_dtype: str = "bf16"):
         import torch
 
         from tensorfold.cuda.nvfp4.format import is_quantized
@@ -48,6 +48,14 @@ class Qwen27Engine:
         if exl3 and volta():
             raise ValueError("EXL3 packs of Qwen3.8-27B need sm_80 or newer kernels: on a Volta GPU serve an NVFP4 "
                              "checkpoint (RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead) or the MLX one")
+        from tensorfold.cuda.kernels.kvpack import check as check_kv
+
+        self.kv_dtype = check_kv(kv_dtype)
+        if self.kv_dtype != "bf16" and tp != 1:
+            raise ValueError(f"--kv-dtype {kv_dtype} runs on one GPU: two ranks keep the 27B's caches in bf16")
+        if self.kv_dtype != "bf16" and volta():
+            raise ValueError(f"--kv-dtype {kv_dtype} needs sm_80 or newer: the sm_70 attention kernel reads bf16 caches")
+        bits = 8 if self.kv_dtype == "int8" else 16
         if nvfp4 and vision:
             raise ValueError("image input on CUDA is tested on the MLX checkpoint only: drop --vision for an NVFP4 "
                              "checkpoint, or serve TensorFold/Qwen3.8-27B-MLX-4bit")
@@ -108,7 +116,7 @@ class Qwen27Engine:
         many = streams > 1
         # prompt chunks sized to the card (4096 rows from 80 GB), the verify scratch to the rows a round takes
         chunk = prompt_rows(total_bytes(torch), prompt_row_bytes(config(model_dir), tp))
-        sized = dict(prompt_staging=volta())
+        sized = dict(prompt_staging=volta(), kv_bits=bits)
         geometry = ((lambda text: stream_geometry(text, tp, streams, keep, first=256 if tp == 1 else None, **sized)) if many
                     else (lambda text: gdn_geometry(text, tp, max_rows, rows=max_rows, prompt=chunk, evicts=tp == 1, **sized)))
         # an affine checkpoint's packed words at their stored precision; an EXL3 pack's by its own format
@@ -157,6 +165,10 @@ class Qwen27Engine:
             full = loader(model_dir) if loader is not None else load(model_dir, tiled=True)
             self.w = full
         self.w.prompt_rows = chunk
+        self.w.kv_dtype = self.kv_dtype
+        if self.kv_dtype != "bf16" and rank == 0:
+            print(f"[tensorfold] {self.kv_dtype} KV cache (fp16 scale per 32 values): "
+                  f"{self.context_window} tokens a window", flush=True)
         self.draft = None
         if draft_dir is not None and (rank == 0 or (tp == 2 and tp_draft)):
             from .dflash1 import drafter_class
@@ -206,7 +218,7 @@ class Qwen27Engine:
 
             plan = self.capacity_plan
             spare = plan["budget_bytes"] - plan["weight_bytes_estimate"] - plan["cache_workspace_bytes_estimate"]
-            self.room = KVRoom(self.cache, spare + live_kv(config(model_dir), 1, self.context_window))
+            self.room = KVRoom(self.cache, spare + live_kv(config(model_dir), 1, self.context_window, bits))
         # ``streams`` > 1: up to that many requests decoded together, their windows verified in one forward
         self.concurrent = streams > 1
         self.multi = self.scheduler = None

@@ -62,7 +62,9 @@ class _Staged:
     def __init__(self, w, width: int, context: int, slots: int, aoffs: dict) -> None:
         c, device = w.config, w.norm.device
         self.width, self.keep = width, c.conv_kernel - 1
-        flat, n_items, chunks = tree_attention.padded_host(list(range(-1, width - 1)), context, c.heads // c.kv_heads)
+        tile = tree_attention.tile_for(w.kv_dtype)
+        flat, n_items, chunks = tree_attention.padded_host(list(range(-1, width - 1)), context, c.heads // c.kv_heads,
+                                                           tile)
         self.o_att = 2 * width
         self.o_stream = self.o_att + width
         self.o_parents = self.o_stream + 4 + 3 * n_items
@@ -81,7 +83,7 @@ class _Staged:
         depths = torch.empty((width,), dtype=torch.int32, device=device)
         self.aplan = tree_attention.Plan(att[:width], att[width:width + 4].view(1, 4),
                                          att[width + 4:width + 4 + 3 * n_items].view(n_items, 3), self.parents, paths,
-                                         depths, chunks, width)
+                                         depths, chunks, width, tile)
         self.plan = deltanet.Plan(d[self.o_gdn:self.o_win].view(width, 3), d[:2], slots, width)
         self.windows = d[self.o_win:].view(width, self.keep + 1)
         self.aoffs = aoffs
@@ -358,9 +360,10 @@ class _MultiStaged:
         c, device = w.config, w.norm.device
         self.S, self.R, self.keep = S, R, c.conv_kernel - 1
         W = self.width = S * R
-        group = c.heads // c.kv_heads
-        items = [x for s in range(S) for chunk in range(context // tree_attention.CHUNK)
-                 for first in range(0, R * group, tree_attention.QUERY_TILE) for x in (s, first, chunk)]
+        group, tile = c.heads // c.kv_heads, tree_attention.tile_for(w.kv_dtype)
+        codes = list(range(context // tree_attention.SPAN)) + [-1 - j for j in range(context // tree_attention.CHUNK)]
+        items = [x for s in range(S) for code in codes
+                 for first in range(0, R * group, tile) for x in (s, first, code)]
         rows = [s for s in range(S) for _ in range(R)]
         streams = [x for s in range(S) for x in (s * R, R, 0, 0)]
         att = rows + streams + items + [0] * W
@@ -385,7 +388,7 @@ class _MultiStaged:
         chunks = -(-(context + R) // tree_attention.CHUNK)
         self.aplan = tree_attention.Plan(a[:W], a[W:W + 4 * S].view(S, 4), a[W + 4 * S:W + 4 * S + 3 * n_items].view(
             n_items, 3), self.parents, torch.empty((W, tree_attention.MAX_NODES), dtype=torch.int32, device=device),
-            torch.empty((W,), dtype=torch.int32, device=device), chunks, W)
+            torch.empty((W,), dtype=torch.int32, device=device), chunks, W, tile)
         self.plan = deltanet.Plan(d[self.o_gdn:self.o_starts].view(W, 3), d[self.o_starts:self.o_win], slots, R)
         self.windows = d[self.o_win:self.o_real].view(W, self.keep + 1)
         self.real = d[self.o_real:]

@@ -198,7 +198,8 @@ class DFlash2:
         self.eps = float(cfg["rms_norm_eps"])
         self.theta = float(cfg["rope_parameters"]["rope_theta"])
         self.mask_id = int(cfg["dflash_config"]["mask_token_id"])
-        self.taps = tuple(int(i) for i in cfg["dflash_config"]["target_layer_ids"])     # the target's tap layers
+        # the target's tap layers (a config without them: Qwen3.8-27B's five)
+        self.taps = tuple(int(i) for i in cfg["dflash_config"].get("target_layer_ids", (5, 19, 33, 47, 61)))
         self.trained = int(cfg["dflash_config"].get("block_size", 8))     # its training block: the planner's floor
         self.group_size = int(cfg["dflash_config"]["conv_group_size"])
         self.layers = int(cfg["num_hidden_layers"])

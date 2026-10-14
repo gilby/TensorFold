@@ -267,17 +267,18 @@ class _Tensors:
         self.files.close()                    # the reader's pinned staging goes back to the system
 
 
-def load(model_dir: str | Path, device: str = "cuda", *, tiled: bool = False, mlp=None) -> Weights:
-    """MLX affine 4-bit (``tiled``: projections packed as read; ``mlp(prefix, get, qlinear, cfg)``: a layer's MLP fields), an EXL3 pack, or NVFP4."""
+def load(model_dir: str | Path, device: str = "cuda", *, tiled: bool = False, mlp=None, nvfp4_mlp=None,
+         exl3_mlp=None) -> Weights:
+    """MLX affine 4-bit (``tiled``: projections packed as read; ``mlp(prefix, get, qlinear, cfg)``: a layer's MLP fields), an EXL3 pack, or NVFP4 (``nvfp4_mlp(prefix, tensors, cfg)``)."""
 
     from .exl3_load import load_exl3, quant_config
     from .nvfp4_load import load_nvfp4, quantized
 
     model_dir = Path(model_dir)
     if quant_config(model_dir) is not None:
-        return load_exl3(model_dir, device)
+        return load_exl3(model_dir, device, mlp=exl3_mlp)
     if quantized(model_dir):
-        return load_nvfp4(model_dir, device)
+        return load_nvfp4(model_dir, device, mlp=nvfp4_mlp)
     cfg = Config.read(model_dir)
     raw = json.loads((model_dir / "config.json").read_text())
     t = _Tensors(model_dir, device)

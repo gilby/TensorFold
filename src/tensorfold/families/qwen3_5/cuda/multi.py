@@ -17,7 +17,7 @@ from .decode import CopyIndex, clone_state
 from .decode_tp import SAMPLING_WORDS as W, _sample_split, _share, first_token, pack_sampling, unpack_sampling
 from .draft_tree import allocate
 from .engine import entry_end
-from .forward import State, _paths, commit_streams, multi_tree_forward, path_indices, reserve
+from .forward import State, _paths, commit, commit_streams, multi_tree_forward, path_indices, reserve
 from .prefill import CHUNK, Piece, prefill_batch, prefill_state
 from .weights import Weights
 
@@ -29,6 +29,27 @@ GIB = 1024**3
 TIMED = 16                              # the last rounds whose time beside the forward sets a stream count's overhead
 DEPTH_CHIPS = ((12, 0),)                # tuned planning (measured overhead, curve steps, the block); else 0.6.0's
 BATCH = True                            # queued foreground prompts' steps share one prefill forward
+
+
+import os as _os
+
+PROFILE = _os.environ.get("TF_ROUND_TIMES", "") == "1"
+_marks: dict[str, list[float]] = {}
+
+
+def _mark(name: str, t0: float) -> float:
+    """``TF_ROUND_TIMES=1``: this stage's ms since ``t0`` (after a sync), kept for the periodic report."""
+
+    if not PROFILE:
+        return t0
+    torch.cuda.synchronize()
+    now = time.perf_counter()
+    _marks.setdefault(name, []).append(1e3 * (now - t0))
+    if name == "commit" and len(_marks[name]) >= 64:
+        print("[tensorfold] round ms (median of 64): " + ", ".join(
+            f"{k} {sorted(v)[len(v) // 2]:.1f}" for k, v in _marks.items()), flush=True)
+        _marks.clear()
+    return now
 
 
 def calibration_rows(streams: int, steps: bool = True) -> list[int]:
@@ -94,6 +115,9 @@ class MultiDecoder:
     depth: bool = True                        # whether the block follows the trees here (DEPTH_CHIPS)
     spent: dict | None = None                 # streams -> the last rounds' ms beside the forward
     last: tuple | None = None                 # (start, streams, rows) of the round before
+    chain = None                              # ChainGraphs: a lone DSpark stream's verify replays a CUDA graph
+    resident = None                           # the stream whose state lives in ``chain``'s buffers
+    held: tuple = ()                          # those buffers' addresses when it moved in (a regrowth drops graphs)
 
     def __init__(self, w: Weights, draft=None, *, max_rows: int = 16, allow_copy: bool = True, stop_eos: bool = True,
                  keep: int = 8, rank: int = 0, world: int = 1, context: int = 0, points=None, vision=None) -> None:
@@ -247,7 +271,9 @@ class MultiDecoder:
         """Prefill queued prompts a step: several foreground ones in one forward (``_batch``), else the oldest to its
         next kept state, or STEP rows while others decode."""
 
-        batch = self._batch() if BATCH and sum(not x.background for x in self.filling) > 1 else []
+        # a batched prefill takes dense layers only (prefill_rows): a MoE target fills one prompt a step
+        dense = all(getattr(layer, "moe", None) is None for layer in self.w.layers)
+        batch = self._batch() if BATCH and dense and sum(not x.background for x in self.filling) > 1 else []
         if len(batch) > 1:
             return self._fill_batch(batch)
         s = next_fill(self.filling)
@@ -405,6 +431,11 @@ class MultiDecoder:
         if not live:
             self.last = None
             return done
+        if len(live) == 1 and self.chain is not None:
+            alone = self._alone(live[0])
+            if alone is not None:
+                self.last = None
+                return done + alone
         copied: dict[int, list[int]] = {}
         plan = [(s.sid, self._mode(s, copied), s.out[-1], len(s.context)) for s in live]
         self._send([ROUND, len(plan), *[x for item in plan for x in item]])
@@ -415,7 +446,10 @@ class MultiDecoder:
             paths.append(path)
             ends.append(end)
         self._send([x for path in paths for x in (len(path), *path)])
+        t0 = time.perf_counter() if PROFILE else 0.0
         self._commit(plan, wins, record, taps, starts, paths)
+        if PROFILE:
+            self._t_end = _mark("commit", t0)
         self.last = (start, len(plan), sum(len(t) for t, _ in wins)) if self.costs is not None else None
         for s, (tokens, _), path, end in zip(live, wins, paths, ends):
             new = [tokens[r] for r in path[1:]] + [end]
@@ -431,6 +465,49 @@ class MultiDecoder:
         if all(s.done for s in live):
             self.last = None                          # the next round waits for requests: not this round's time
         return done + [s for s in live if s.done]
+
+    def _addresses(self, st: State) -> tuple:
+        return tuple(t.data_ptr() for t in st.rec + st.conv if t is not None) + tuple(
+            x.data_ptr() for kv in st.kv if kv is not None for x in kv)
+
+    def _alone(self, s: Stream) -> list[Stream] | None:
+        """A lone drafting stream's round with the chain graphs (the engine's ``--parallel 1`` path: the drafter's
+        chain verified by one graph launch, the same kernels, so the same bits); None: the eager round. Eagerly, a
+        lone stream on an A40 behind a 2.1 GHz Xeon ran at 60-87 tok/s against 167-221 at ``--parallel 1``."""
+
+        g = self.chain
+        if (not s.draft or not self.drafts or s.constraint is not None or s.error is not None
+                or s.vision is not None or s.st.pos + self.max_rows + 1 > g.capacity):
+            return None
+        need = min(g.capacity, s.st.pos + (s.count - len(s.out)) + self.max_rows)
+        if self.resident is not s or s.st is not g.st or self._addresses(s.st) != self.held or need > g.rows:
+            if s.st is g.st and self._addresses(s.st) != self.held:
+                g.rows = 0                            # its buffers were regrown: the graphs read the old ones
+            s.st = g.load(s.st, need)
+            self.resident, self.held = s, self._addresses(s.st)
+        pending = s.out[-1]
+        guesses = s.copies.propose(s.context, self.max_rows - 1) if s.copies is not None else []
+        mode = COPY if guesses else TREE
+        block = self.block if self.depth else self.max_rows
+        if not guesses:
+            launched = self.draft.launch_blocks([s.snap], [pending], self.max_rows - 1, block)
+            guesses, parents, _ = self.draft.finish_tree(launched[0], len(s.context), self.max_rows - 1, s.sampling)
+            if parents != list(range(-1, len(guesses) - 1)):
+                raise RuntimeError("the chain graphs need a chain drafter")
+        tokens = [pending] + list(guesses)
+        parents = [-1] + list(range(len(tokens) - 1))
+        if mode == TREE:
+            self.block = self._deepest([(s.sid, mode, pending, len(s.context))], [(tokens, parents)], block)
+        logits, record, taps = g.verify(tokens)
+        positions = [s.st.pos + 1 + i for i in range(len(tokens))]
+        rows = sample_streams(logits, [0, len(tokens)], [positions], [s.sampling])[0]
+        path, end = accept(tokens, list(range(-1, len(tokens) - 1)), rows, s.count - len(s.out), self._ends(s))
+        commit(s.st, record, path, in_place=True)
+        s.committed.extend(tokens[r] for r in path)
+        s.snap = self.draft.add_taps_streams([s.snap], [taps[path]])[0]
+        s.counted(len(tokens))
+        s.take([tokens[r] for r in path[1:]] + [end], self._ends(s))
+        return [s] if s.done else []
 
     def _timed(self, now: float) -> None:
         """The round before: its time beside the forward (its start to this round's, less the curve's forward)."""
@@ -525,10 +602,12 @@ class MultiDecoder:
         blocks = {}
         tree = [(sid, pending) for sid, mode, pending, _ in plan if mode == TREE] if self.drafts else []
         block = self.block if self.depth else self.max_rows    # one stream too: DFlash2 drafts best near 8 rows
+        t0 = _mark("between", getattr(self, "_t_end", time.perf_counter())) if PROFILE else 0.0
         if tree:                                      # every stream's block in one drafter pass
             launched = self.draft.launch_blocks([self.streams[sid].snap for sid, _ in tree],
                                                 [pending for _, pending in tree], self.max_rows - 1, block)
             blocks = {sid: block for (sid, _), block in zip(tree, launched)}
+        t0 = _mark("draft", t0)
         grammars = {}
         if self.rank == 0:
             wins = self._windows(plan, copied, blocks)
@@ -537,12 +616,14 @@ class MultiDecoder:
         else:
             wins = _unflatten(_share(None, 1, self.device), pairs=True)
             grammars = self._masks(plan, wins) if self.split else {}
+        t0 = _mark("plan", t0)
         self.block = self._deepest(plan, wins, block)
         states = [self.streams[item[0]].st for item in plan]
         taps_wanted = self.drafts and any(self.streams[item[0]].draft for item in plan)
         logits, record, taps, starts = multi_tree_forward(
             self.w, [(t, p, st) for (t, p), st in zip(wins, states)],
             full_logits=self.split or self.rank == 0, tp=self.world == 2, capture_taps=taps_wanted)
+        t0 = _mark("verify", t0)
         for k, window in grammars.items():          # a constrained stream's rows, each masked by its path
             self.streams[plan[k][0]].constraint.mask(logits[starts[k]:starts[k + 1]], window,
                                                      self.rank * self.w.head.n if self.split else 0)
@@ -553,6 +634,7 @@ class MultiDecoder:
                        for k in range(len(plan))]
         else:
             sampled = sample_streams(logits, starts, positions, samplings) if self.rank == 0 else [None] * len(plan)
+        _mark("sample", t0)
         return wins, record, taps, starts, sampled
 
     def _deepest(self, plan, wins, block: int) -> int:

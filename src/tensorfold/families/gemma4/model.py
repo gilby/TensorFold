@@ -310,11 +310,19 @@ def realize(model: Any) -> None:
 
 
 def load(model_dir: Path, *, backend: str | None = None, check: bool = True, drafter: str = "",
-         drafter_bits: int = 8) -> tuple[Gemma4, Any]:
+         drafter_bits: int = 8, drafts: int = 0) -> tuple[Gemma4, Any]:
     from mlx_lm import load as mlx_load
 
     model, tokenizer = mlx_load(str(model_dir))
     realize(model)                     # before a draft model wraps the tapped layers
+    if drafter and is_assistant(drafter):
+        from tensorfold.families.gemma4.assisted import Gemma4Assisted
+        from tensorfold.families.gemma4_unified.assistant import Assistant
+
+        assistant = Assistant.load(Path(drafter))
+        print(f"[tensorfold] drafter {drafter} (Gemma 4 MTP assistant, {assistant.describe()})", flush=True)
+        return Gemma4Assisted(model, backend=backend, check=check, tokenizer=tokenizer, drafter=assistant,
+                              drafts=drafts), tokenizer
     draft = None
     if drafter:
         from tensorfold.drafters.dflash_drafter import DFlashDrafter
@@ -322,3 +330,14 @@ def load(model_dir: Path, *, backend: str | None = None, check: bool = True, dra
         draft = DFlashDrafter(model, drafter, bits=int(drafter_bits))
         print(f"[tensorfold] drafter {draft.path} block={draft.block_size} bits={drafter_bits or 16}", flush=True)
     return Gemma4(model, backend=backend, check=check, tokenizer=tokenizer, drafter=draft), tokenizer
+
+
+def is_assistant(drafter: str | Path) -> bool:
+    """Whether a drafter directory holds a Gemma 4 MTP assistant (else a DFlash draft model)."""
+
+    import json
+
+    config = Path(drafter) / "config.json"
+    if not config.is_file():
+        return False
+    return json.loads(config.read_text()).get("model_type") in ("gemma4_assistant", "gemma4_unified_assistant")

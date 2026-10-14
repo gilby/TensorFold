@@ -94,8 +94,8 @@ class _Staged:
         h[:n] = tokens
         h[n:W] = 0
         h[W:2 * W] = np.asarray(depths) + (p + delta)
-        h[self.o_stream + 2] = p                                 # the stream's committed keys and chunks
-        h[self.o_stream + 3] = -(-(p + W) // tree_attention.CHUNK)
+        h[self.o_stream + 2] = p                                 # the stream's committed keys and slots
+        h[self.o_stream + 3] = tree_attention.slots(p, W)
         h[self.o_parents:self.o_parents + W] = att
         h[self.o_gdn:self.o_win] = entries
         h[self.o_win:] = windows
@@ -408,7 +408,7 @@ class _MultiStaged:
             h[base + n:base + R] = 0
             h[W + base:W + base + R] = np.asarray(depths) + (st.pos + st.rope_delta)
             h[self.o_stream + 4 * s + 2] = st.pos
-            h[self.o_stream + 4 * s + 3] = -(-(st.pos + R) // tree_attention.CHUNK)
+            h[self.o_stream + 4 * s + 3] = tree_attention.slots(st.pos, R)
             h[self.o_parents + base:self.o_parents + base + R] = [x if x < 0 else x + base for x in att]
             e = np.asarray(entries).reshape(R, 3)
             e[:, 0] += base

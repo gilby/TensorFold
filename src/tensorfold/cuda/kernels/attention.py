@@ -283,7 +283,18 @@ def groups(p: int, w: int) -> int:
     """Whole committed groups fold in their programs only when groups times rows fills the GPU."""
 
     g = p // SPAN
-    return g if g * w >= MIN_GROUPED else 0
+    return g if g * w >= MIN_GROUPED and not _chunkwise() else 0
+
+
+def _chunkwise() -> bool:
+    """Whether the current device's kernels write one partial a chunk (sm_70's): no group folds in a program there."""
+
+    return torch.cuda.is_available() and _chunkwise_at(torch.cuda.current_device())
+
+
+@lru_cache(maxsize=None)
+def _chunkwise_at(index: int) -> bool:
+    return volta(torch.device("cuda", index))
 
 
 def slots(p: int, w: int) -> int:
@@ -416,7 +427,7 @@ def attention(q: torch.Tensor, k_nodes: torch.Tensor, v_nodes: torch.Tensor, off
     partial_m = torch.empty((p.chunks, w, h), dtype=torch.float32, device=q.device)
     partial_l = torch.empty_like(partial_m)
     if volta(q.device):
-        # sm_70: tl.dot has no tensor-core path there; CUDA kernels write every chunk partial in the same layout
+        # sm_70: tl.dot has no tensor-core path there; CUDA kernels write every chunk partial (``groups`` is 0 there)
         if g > VOLTA_GROUP:
             raise ValueError(f"the sm_70 attention kernel takes up to {VOLTA_GROUP} query heads a key head, not {g}")
         if qb:

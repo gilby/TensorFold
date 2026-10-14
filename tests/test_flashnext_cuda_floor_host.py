@@ -48,3 +48,20 @@ def test_a_machine_without_cuda_changes_nothing(monkeypatch):
                                 get_device_name=lambda *a: "Fake GPU")
     monkeypatch.setitem(sys.modules, "torch", torch)
     build.refuse_small_gpu()
+
+
+def test_a_named_capability_below_the_floor_is_admitted(monkeypatch):
+    """``also`` admits exactly the capabilities it names (sm_70 for NVFP4 checkpoints); its neighbours stay refused."""
+
+    _fake_torch(monkeypatch, (7, 0), "Tesla V100")
+    build.refuse_small_gpu(also=(build.VOLTA,))
+    _fake_torch(monkeypatch, (8, 6), "Some GPU")
+    with pytest.raises(ValueError, match=r"sm_120 and sm_121.*Some GPU"):
+        build.refuse_small_gpu(also=(build.VOLTA,))
+
+
+def test_sm70_refuses_a_checkpoint_that_is_not_nvfp4(tmp_path, monkeypatch):
+    (tmp_path / "config.json").write_text('{"model_type": "qwen4_exp", "quantization": {"bits": 4, "group_size": 32}}')
+    _fake_torch(monkeypatch, (7, 0), "Tesla V100")
+    with pytest.raises(ValueError, match=r"Tesla V100.*7\.0"):
+        qwen4_exp.cuda_engine(tmp_path, no_drafts=True)

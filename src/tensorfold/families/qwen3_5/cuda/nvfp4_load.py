@@ -44,6 +44,12 @@ class Plain8(Plain):
     def nbytes(self) -> int:
         return super().nbytes() + self.rows8.nbytes()
 
+    def outputs(self, rows: torch.Tensor) -> "Plain8":
+        return Plain8(super().outputs(rows).weight, rows8=self.rows8.outputs(rows))
+
+    def inputs(self, rank: int, world: int = 2) -> "Plain8":
+        return Plain8(super().inputs(rank, world).weight, rows8=self.rows8.inputs(rank, world))
+
 
 def _volta() -> bool:
     from tensorfold.cuda.build import volta
@@ -129,8 +135,8 @@ def _volta_linear(name: str, kind: str, got: dict, weight: torch.Tensor, recipro
     raise ValueError(f"{name}: {kind} projections are not read on Qwen3.8-27B on sm_70")
 
 
-def load_nvfp4(model_dir: str | Path, device: str = "cuda", *, mlp=None):
-    """NVFP4 and FP8 projections at full precision or in the checkpoint's own math, bf16 ones as stored; ``mlp(prefix, tensors, cfg)``: a layer's MLP fields."""
+def load_nvfp4(model_dir: str | Path, device: str = "cuda", *, mlp=None, layer=None):
+    """NVFP4 and FP8 projections at full precision or in the checkpoint's own math, bf16 ones as stored; ``mlp(prefix, tensors, cfg)``: a layer's MLP fields; ``layer(Layer, cfg)``: each layer as it loads (two ranks: its shard, so one full layer is ever resident)."""
 
     from tensorfold.cuda.capacity import headers
     from tensorfold.cuda.nvfp4 import format as fmt
@@ -189,8 +195,16 @@ def load_nvfp4(model_dir: str | Path, device: str = "cuda", *, mlp=None):
             return lin
         if kind == "fp8":
             s = got["weight_scale"].float().reshape(-1)
+            n, k = weight.shape
+            if s.numel() == n and n > 1 and act_scale(name, got, "fp8") is None:
+                # a scale per output channel (ModelOpt per-channel FP8, as in AEON-7's NVFP4-MIXED 27B): the block
+                # FP8 lane matmul with one fp32 scale per (64 inputs, column), each column's the same
+                from tensorfold.cuda.nvfp4.linear import Fp8BlockLinear
+
+                return Fp8BlockLinear.from_rows(weight, s.view(n, 1).expand(n, k // 64).contiguous())
             if s.numel() != 1:
-                raise ValueError(f"{name}: FP8 with {s.numel()} scales; the CUDA engine reads one scale a tensor")
+                raise ValueError(f"{name}: FP8 with {s.numel()} scales; the CUDA engine reads one scale a tensor "
+                                 "or one an output channel")
             return Fp8Linear.from_checkpoint(weight, float(s[0]), act=act_scale(name, got, "fp8"))
         if kind == "bf16":
             w = weight.to(torch.bfloat16).contiguous()
@@ -225,9 +239,12 @@ def load_nvfp4(model_dir: str | Path, device: str = "cuda", *, mlp=None):
                              q_norm=norm(p + "self_attn.q_norm.weight"), k_norm=norm(p + "self_attn.k_norm.weight"))
         fields = mlp(q + "mlp.", t, cfg) if mlp is not None else \
             {"gate": linear(q + "mlp.gate_proj"), "up": linear(q + "mlp.up_proj"), "down": linear(q + "mlp.down_proj")}
-        layers.append(Layer(linear=cfg.is_linear(i), input_norm=norm(p + "input_layernorm.weight"),
-                            post_norm=norm(p + "post_attention_layernorm.weight"), gdn=gdn, attn=attn,
-                            **{"gate": None, "up": None, "down": None, **fields}))
+        made = Layer(linear=cfg.is_linear(i), input_norm=norm(p + "input_layernorm.weight"),
+                     post_norm=norm(p + "post_attention_layernorm.weight"), gdn=gdn, attn=attn,
+                     **{"gate": None, "up": None, "down": None, **fields})
+        gdn = attn = fields = None
+        layers.append(made if layer is None else layer(made, cfg))
+        del made
     if not any(n.startswith("lm_head.") for n in info):
         raise ValueError("this checkpoint ties its head to the embedding; the CUDA engine reads a separate lm_head")
     if on_volta:                                          # the embedding stays in page-locked host memory

@@ -108,10 +108,17 @@ _GEMMA_TOOL_CALL_BLOCK_RE = re.compile(r"<\|tool_call>\s*(.*?)\s*<tool_call\|>",
 _GEMMA_CALL_RE = re.compile(r"^(?:call)?:([\w.-]+)\s*(\{.*\})$", re.DOTALL)
 _GEMMA_STRING_RE = re.compile(r'<\|"\|>(.*?)<\|"\|>', re.DOTALL)
 _GEMMA_KEY_RE = re.compile(r"(?<=[{,])\s*([A-Za-z_][\w-]*)\s*:")
-# DeepSeek-V4's DSML: one <｜DSML｜tool_calls> block holds invokes of named parameters, string="false" ones as JSON
-_DSML_BLOCK_RE = re.compile(r"<｜DSML｜tool_calls>(.*?)</｜DSML｜tool_calls>", re.DOTALL)
-_DSML_INVOKE_RE = re.compile(r'<｜DSML｜invoke name="([^"]*)">(.*?)</｜DSML｜invoke>', re.DOTALL)
-_DSML_PARAM_RE = re.compile(r'<｜DSML｜parameter name="([^"]*)" string="(true|false)">(.*?)</｜DSML｜parameter>', re.DOTALL)
+# DeepSeek's DSML: one block holds invokes of named parameters, string="false" ones as JSON. V4 writes
+# <｜DSML｜tool_calls>/<｜DSML｜invoke>/<｜DSML｜parameter>; V4.1 <｜DSML｜ calls>/<｜DSML｜ invoke>/<｜DSML｜ parameter>.
+# A block's own opening tag picks its dialect, so the two never mix inside one block.
+_DSML_DIALECTS = {
+    opener: (re.compile(rf"{re.escape(opener)}(.*?){re.escape(opener[:1] + '/' + opener[1:])}", re.DOTALL),
+             re.compile(rf'<｜DSML｜{invoke} name="([^"]*)">(.*?)</｜DSML｜{invoke}>', re.DOTALL),
+             re.compile(rf'<｜DSML｜{param} name="([^"]*)" string="(true|false)">(.*?)</｜DSML｜{param}>', re.DOTALL))
+    for opener, invoke, param in (("<｜DSML｜tool_calls>", "invoke", "parameter"),
+                                  ("<｜DSML｜ calls>", " invoke", " parameter"))
+}
+_DSML_BLOCK_RE, _DSML_INVOKE_RE, _DSML_PARAM_RE = _DSML_DIALECTS["<｜DSML｜tool_calls>"]
 _JSON_FENCE_RE = re.compile(
     r"^\s*```(?:json)?\s*(.*?)\s*```\s*$",
     re.IGNORECASE | re.DOTALL,
@@ -251,19 +258,20 @@ def _parse_tool_call_payload(block: str, schemas: dict[str, dict[str, Any]] | No
     return name, arguments
 
 
-def _parse_dsml_calls(block: str) -> list[tuple[str, dict[str, Any]]] | None:
-    """Every invoke of a DSML block as (name, arguments), or None when anything in it is not a well-formed invoke."""
+def _parse_dsml_calls(block: str, opener: str = "<｜DSML｜tool_calls>") -> list[tuple[str, dict[str, Any]]] | None:
+    """Every invoke of a DSML block's body as (name, arguments), or None when anything in it is not a well-formed invoke."""
 
+    _, invoke_re, param_re = _DSML_DIALECTS[opener]
     calls, at = [], 0
-    for invoke in _DSML_INVOKE_RE.finditer(block):
+    for invoke in invoke_re.finditer(block):
         if block[at:invoke.start()].strip():
             return None
         at = invoke.end()
         arguments: dict[str, Any] = {}
         body = invoke.group(2)
-        if _DSML_PARAM_RE.sub("", body).strip():
+        if param_re.sub("", body).strip():
             return None
-        for name, string, value in _DSML_PARAM_RE.findall(body):
+        for name, string, value in param_re.findall(body):
             if string == "true":
                 arguments[name] = value
                 continue
@@ -336,7 +344,8 @@ def _envelopes(text: str) -> list[tuple[int, int, str]]:
     found = sorted([(m.start(), m.end(), m.group(1).strip()) for m in _TOOL_CALL_BLOCK_RE.finditer(text)]
                    + [(m.start(), m.end(), m.group(2).strip()) for m in _NAMESPACED_TOOL_CALL_BLOCK_RE.finditer(text)]
                    + [(m.start(), m.end(), m.group(1).strip()) for m in _GEMMA_TOOL_CALL_BLOCK_RE.finditer(text)]
-                   + [(m.start(), m.end(), m.group(0)) for m in _DSML_BLOCK_RE.finditer(text)])
+                   + [(m.start(), m.end(), m.group(0)) for block_re, _, _ in _DSML_DIALECTS.values()
+                      for m in block_re.finditer(text)])
     kept: list[tuple[int, int, str]] = []
     for envelope in found:
         if not kept or envelope[0] >= kept[-1][1]:
@@ -368,8 +377,9 @@ def parse_tool_calls_from_content(
         if max_calls is not None and len(calls) >= max_calls:
             continue
         try:
-            if block.startswith("<｜DSML｜tool_calls>"):
-                parsed = _parse_dsml_calls(_DSML_BLOCK_RE.fullmatch(block).group(1))
+            dialect = next((o for o in _DSML_DIALECTS if block.startswith(o)), None)
+            if dialect is not None:
+                parsed = _parse_dsml_calls(_DSML_DIALECTS[dialect][0].fullmatch(block).group(1), dialect)
             else:
                 one = _parse_tool_call_payload(block, schemas, complete=max_calls is not None)
                 parsed = None if one is None else [one]

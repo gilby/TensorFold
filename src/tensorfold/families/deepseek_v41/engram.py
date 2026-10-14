@@ -52,6 +52,7 @@ class NgramHash:
                              f"{cfg.engram_compressed_vocab_size}")
         self.depth = cfg.engram_max_ngram_size - 1
         self.pad = int(self.token_map[cfg.engram_pad_token_id])
+        self.image_token_id = int(cfg.image_token_id)      # an image span's tokens are dead: no n-gram spans one
         primes, multipliers, seen = [], [], set()
         for layer in cfg.engram_layer_ids:
             groups = []
@@ -76,10 +77,12 @@ class NgramHash:
             raise ValueError("deepseek_v41: Engram table rows do not match the official prime layout")
 
     def compress(self, ids: Any) -> np.ndarray:
+        """Compressed ids; an image token's is -1 (dead), as DeepSeek's reference caches an image span."""
+
         ids = np.asarray(ids, dtype=np.int64)
         if ids.size and (ids.min() < 0 or ids.max() >= len(self.token_map)):
             raise ValueError("deepseek_v41: a token id outside Engram's tokenizer vocabulary")
-        return self.token_map[ids]
+        return np.where(ids == self.image_token_id, -1, self.token_map[ids])
 
     def __call__(self, ids: Any, history: np.ndarray) -> np.ndarray:
         """Row ids [L, tables, depth * heads] for tokens ``ids`` [L] after compressed ``history`` [depth] (-1: none)."""
@@ -191,17 +194,26 @@ class EngramTable:
     def nbytes(self) -> int:
         return int(self.weight.nbytes + self.scales.nbytes + self.biases.nbytes)
 
-    def __call__(self, rows: np.ndarray) -> mx.array:
-        """The rows' dequantized values [*rows.shape, dim] in bf16."""
+    def read(self, rows: np.ndarray) -> tuple[tuple[int, ...], np.ndarray, np.ndarray, np.ndarray]:
+        """The rows' stored codes, scales and biases from the file (host work: safe on a worker thread)."""
 
         flat = np.asarray(rows, dtype=np.int64).reshape(-1)
         if flat.size and (flat.min() < 0 or flat.max() >= self.rows):
             raise IndexError("deepseek_v41: an Engram row outside its table")
-        w = mx.array(self.weight.rows(flat))
-        s = mx.array(self.scales.rows(flat)).view(mx.bfloat16)
-        b = mx.array(self.biases.rows(flat)).view(mx.bfloat16)
-        values = mx.dequantize(w, s, b, group_size=self.group, bits=self.bits, mode="affine")
-        return values.reshape(*rows.shape, self.dim).astype(mx.bfloat16)
+        return tuple(np.asarray(rows).shape), self.weight.rows(flat), self.scales.rows(flat), self.biases.rows(flat)
+
+    def values(self, read: tuple[tuple[int, ...], np.ndarray, np.ndarray, np.ndarray]) -> mx.array:
+        """read's dequantized values [*rows.shape, dim] in bf16."""
+
+        shape, w, s, b = read
+        values = mx.dequantize(mx.array(w), mx.array(s).view(mx.bfloat16), mx.array(b).view(mx.bfloat16),
+                               group_size=self.group, bits=self.bits, mode="affine")
+        return values.reshape(*shape, self.dim).astype(mx.bfloat16)
+
+    def __call__(self, rows: np.ndarray) -> mx.array:
+        """The rows' dequantized values [*rows.shape, dim] in bf16."""
+
+        return self.values(self.read(rows))
 
 
 class Engram:
@@ -216,11 +228,14 @@ class Engram:
     def arrays(self) -> list[mx.array]:
         return [*self.wkv.arrays(), self.q_weight, self.k_weight]
 
-    def __call__(self, h: mx.array, rows: np.ndarray) -> mx.array:
-        """Streams h [R, 4, D] and their rows' lookups [R, lookups]: the new streams (oMLX's arithmetic order)."""
+    def __call__(self, h: mx.array, rows: Any, image_mask: mx.array | None = None) -> mx.array:
+        """Streams h [R, 4, D] and their rows' lookups [R, lookups] (or a started read): the new streams.
+
+        image_mask [R]: image rows take no Engram contribution (their gate is 0)."""
 
         R = int(h.shape[0])
-        kv = self.wkv(self.table(rows).reshape(R, -1))
+        looked = self.table.values(rows.result()) if hasattr(rows, "result") else self.table(rows)   # a started read
+        kv = self.wkv(looked.reshape(R, -1))
         key, value = kv[:, :self.dim * self.hc], kv[:, self.dim * self.hc:]
         key = key.astype(mx.float32).reshape(R, self.hc, self.dim)
         x = h.astype(mx.float32)
@@ -228,4 +243,41 @@ class Engram:
         dot = mx.sum(x * self.q_weight * self.k_weight * key, -1) * inv * self.dim ** -0.5
         gate = mx.sigmoid(mx.sign(dot) * mx.sqrt(mx.maximum(mx.abs(dot), 1e-6)))
         gate = mx.where(dot == 0, mx.sigmoid(mx.array(0.001)), gate)      # copysign(+sqrt, 0) is positive
+        if image_mask is not None:
+            gate = mx.where(image_mask[:, None], 0, gate)
         return (x + gate[..., None] * value.astype(mx.float32)[:, None, :]).astype(h.dtype)
+
+
+_READS: Any = None
+
+
+def start_read(table: EngramTable, rows: np.ndarray) -> Any:
+    """table.read(rows) on a worker thread, so the file reads overlap the GPU's earlier layers."""
+
+    global _READS
+    if _READS is None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _READS = ThreadPoolExecutor(max_workers=4, thread_name_prefix="dsv41-engram-read")
+    return _READS.submit(table.read, np.asarray(rows))
+
+
+_WARM: Any = None
+
+
+def warm(table: EngramTable, rows: np.ndarray) -> Any:
+    """Read the pages ``rows`` live on into the page cache on a background thread (bytes only: no bits change)."""
+
+    global _WARM
+    if _WARM is None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _WARM = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dsv41-engram-warm")
+    flat = np.asarray(rows, dtype=np.int64).reshape(-1)
+
+    def run() -> None:
+        for part in (table.weight, table.scales, table.biases):
+            if flat.size > PREFETCH_ROWS and 0 < part.row_bytes <= PAGE:
+                part._prefetch(flat)
+
+    return _WARM.submit(run)

@@ -14,6 +14,12 @@ from tensorfold.families.deepseek_v41.engram import Engram, NgramHash
 from tensorfold.families.deepseek_v41.quant import Experts, Linear, fp8, quantize_activation, swiglu_fp8
 from tensorfold.kernels.deepseek.v41 import rows as KV
 
+# prompt chunks' attention as fp32 GEMMs (TF_DSV41_PROMPT_ATTN=kernel: the decode rows' fused kernel instead)
+PROMPT_GEMM = __import__("os").environ.get("TF_DSV41_PROMPT_ATTN", "kernel") == "gemm"   # opt-in: mean KL 0.004-0.006 vs the kernel
+# Engram's file reads on a worker thread from the forward's start (TF_DSV41_ENGRAM_AHEAD=0: read in place)
+ENGRAM_AHEAD = __import__("os").environ.get("TF_DSV41_ENGRAM_AHEAD", "1") != "0"
+ENGRAM_WARM = __import__("os").environ.get("TF_DSV41_ENGRAM_WARM", "1") != "0"   # next chunk's pages read ahead
+
 
 @mx.compile
 def _norm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
@@ -134,14 +140,22 @@ class Compressor:
     def arrays(self) -> list[mx.array]:
         return [self.wkv if self.ratio == 1 else self.proj32, self.norm]
 
-    def latents(self, x: mx.array, cache: LayerCache, start: int) -> tuple[mx.array | None, int]:
+    def project(self, x: mx.array) -> mx.array:
+        """The rows' own part of ``latents``: ratio 1's normed latents, ratio 2's fp32 projection."""
+
+        if self.ratio == 1:
+            return rms(KV.matmul(x, self.wkv, x.dtype), self.norm, self.eps)
+        return KV.matmul(x.astype(mx.float32), self.proj32, mx.float32)          # [rows, 2 * dim] fp32
+
+    def latents(self, x: mx.array, cache: LayerCache, start: int,
+                projected: mx.array | None = None) -> tuple[mx.array | None, int]:
         """The rows' completed blocks' latents (normed, not roped) and the first block's index."""
 
         r, rows = self.ratio, int(x.shape[0])
         first, last = start // r, (start + rows) // r
+        proj = self.project(x) if projected is None else projected
         if r == 1:
-            return rms(KV.matmul(x, self.wkv, x.dtype), self.norm, self.eps), first
-        proj = KV.matmul(x.astype(mx.float32), self.proj32, mx.float32)         # [rows, 2 * dim] fp32
+            return proj, first
         lo = first * r
         data = mx.concatenate([cache.proj_rows(lo, start), proj]) if start > lo else proj
         cache.write_proj(proj, start)
@@ -247,15 +261,43 @@ class Attention:
     def __call__(self, x: mx.array, caches: list[LayerCache], start: int, shared: dict[str, Any]) -> mx.array:
         """x [L, D] (attn-normed) at positions start .. of one stream whose layer caches are ``caches``."""
 
-        cfg, L = self.cfg, int(x.shape[0])
-        cache = caches[self.layer]
-        positions = mx.arange(start, start + L)
+        return self.streams(x, [caches], [start], [int(x.shape[0])], [shared])
+
+    def streams(self, x: mx.array, caches: list[list[LayerCache]], starts: list[int], lengths: list[int],
+                shared: list[dict[str, Any]]) -> mx.array:
+        """Several streams' rows x [L, D] in one pass: projections over every row, attention stream by stream."""
+
+        L = int(x.shape[0])
+        spans = [(int(s), int(n)) for s, n in zip(starts, lengths)]
+        positions = mx.concatenate([mx.arange(s, s + n) for s, n in spans]) if len(spans) > 1 \
+            else mx.arange(spans[0][0], spans[0][0] + spans[0][1])
         xq = fp8(x)
         query = self.wq_a(xq, prequantized=True)
         kv_in = self.wkv(xq, prequantized=True)
         qr = rms(query, self.q_norm, self.eps)
         q = rope(self.wq_b(qr).reshape(L, self.heads, self.dim), positions, self.inv_freq)
         kv = fp8(rope(rms(kv_in, self.kv_norm, self.eps), positions, self.inv_freq).astype(mx.float32))
+        projected = self.compressor.project(x) if self.ratio and self.compressor is not None else None
+        index = self.indexer.queries(qr, x, positions, self.inv_freq) \
+            if self.ratio and self.indexer is not None else None
+        outs, at = [], 0
+        for b, (start, n) in enumerate(spans):
+            rows = slice(at, at + n)
+            outs.append(self._stream(q[rows], kv[rows], x[rows], positions[rows], caches[b], start, n, shared[b],
+                                     None if projected is None else projected[rows],
+                                     None if index is None else (index[0][rows], index[1][rows])))
+            at += n
+        out = mx.concatenate(outs) if len(outs) > 1 else outs[0]
+        out = rope(out, positions, self.inv_freq, inverse=True)
+        u = KV.matmul(out.reshape(L, -1), self.wo_a_flat, out.dtype, groups=self.groups)
+        return self.wo_b(u)
+
+    def _stream(self, q: mx.array, kv: mx.array, x: mx.array, positions: mx.array, caches: list[LayerCache],
+                start: int, L: int, shared: dict[str, Any], projected: mx.array | None,
+                index: tuple[mx.array, mx.array] | None) -> mx.array:
+        """One stream's cache writes, pool rows, index choice and attention: [L, H, D]."""
+
+        cache = caches[self.layer]
         lo = max(0, start - (self.window - 1))
         keys = mx.concatenate([cache.key_rows(lo, start), kv]) if start > lo else kv
         cache.write_keys(kv, start)
@@ -263,7 +305,7 @@ class Attention:
         if self.ratio:
             src = caches[self.kv_src]
             if self.compressor is not None:                         # this layer produces the shared pool rows
-                latent, first = self.compressor.latents(x, cache, start)
+                latent, first = self.compressor.latents(x, cache, start, projected)
                 if latent is not None:
                     n = int(latent.shape[0])
                     pos = (mx.arange(first, first + n) * self.ratio).astype(mx.int32)
@@ -271,21 +313,18 @@ class Attention:
                     cache.write_pool(pooled, first, "pool")
                     cache.write_pool(self.indexer.keys(latent, pos, self.inv_freq), first, "ipool")
             if self.indexer is not None:
-                shared["idx"] = self._choose(qr, x, positions, start, L, src, shared)
+                shared["idx"] = self._choose(index, positions, start, L, src, shared)
             chosen = shared["idx"]
-        out = self._attend(q, keys, lo, start, chosen, caches[self.kv_src] if self.ratio else None)
-        out = rope(out, positions, self.inv_freq, inverse=True)
-        u = KV.matmul(out.reshape(L, -1), self.wo_a_flat, out.dtype, groups=self.groups)
-        return self.wo_b(u)
+        return self._attend(q, keys, lo, start, chosen, caches[self.kv_src] if self.ratio else None)
 
-    def _choose(self, qr: mx.array, x: mx.array, positions: mx.array, start: int, L: int, src: LayerCache,
+    def _choose(self, index: tuple[mx.array, mx.array], positions: mx.array, start: int, L: int, src: LayerCache,
                 shared: dict[str, Any]) -> mx.array:
         """Each query's chosen pool rows [L, k] (ascending, -1 unused), as the index (and candidates) pick them."""
 
         cfg, r = self.cfg, self.ratio
         visible = (positions + 1) // r                                            # pool rows each query may see
         n = (start + L) // r
-        iq, iw = self.indexer.queries(qr, x, positions, self.inv_freq)
+        iq, iw = index
         picks, blocks_out = [], []
         for q0 in range(0, L, INDEX_QUERIES):
             q1 = min(L, q0 + INDEX_QUERIES)
@@ -344,6 +383,9 @@ class Attention:
                 slot = pos - self.window + 1 + mx.arange(window)[None, :]
             ok = (slot >= lo) & (slot <= pos)
             comp = chosen[q0:q1] if chosen is not None and int(chosen.shape[-1]) else None
+            if PROMPT_GEMM and not KV.rows_mode() and L > DECODE_ROWS and KV.metal():
+                outs.append(self._gemm_softmax(q[q0:q1], keys, lo, slot, ok, comp, src))
+                continue
             if KV.attention_fits(window + (0 if comp is None else int(comp.shape[-1])), self.dim):
                 wi = mx.where(ok, slot - lo, -1)
                 ci = comp if comp is not None else mx.zeros((n, 0), dtype=mx.int32)
@@ -360,6 +402,27 @@ class Attention:
                 ok = mx.concatenate([ok, ids >= 0], axis=1)
             outs.append(self._grouped_softmax(q[q0:q1], values, ok).astype(q.dtype))
         return mx.concatenate(outs) if len(outs) > 1 else outs[0]
+
+    def _gemm_softmax(self, q: mx.array, keys: mx.array, lo: int, slot: mx.array, ok: mx.array,
+                      comp: mx.array | None, src: LayerCache | None) -> mx.array:
+        """A prompt block's attention as two fp32 GEMMs a query (its heads share the slots): [n, H, D].
+
+        Each query's own slots only, so a query's result never depends on the other queries of its block."""
+
+        n, window = int(q.shape[0]), int(slot.shape[-1])
+        values = keys[mx.clip(slot - lo, 0, int(keys.shape[0]) - 1).reshape(-1)].reshape(n, window, self.dim)
+        if comp is not None and src is not None and src.pool is not None:
+            sel = src.pool[mx.maximum(comp, 0).reshape(-1)].reshape(n, -1, self.dim).astype(mx.float32)
+            values = mx.concatenate([values.astype(mx.float32), sel], axis=1)
+            ok = mx.concatenate([ok, comp >= 0], axis=1)
+        values = values.astype(mx.float32)
+        s = mx.matmul(q.astype(mx.float32), values.transpose(0, 2, 1)) * self.scale          # [n, H, S]
+        s = mx.where(ok[:, None, :], s, -mx.inf)
+        m = mx.max(s, axis=-1, keepdims=True)
+        p = KV.fexp(s - m)
+        total = mx.sum(p, axis=-1) + KV.fexp(self.sink[None, :] - m[..., 0])
+        out = mx.matmul(p.astype(mx.bfloat16).astype(mx.float32), values) / total[..., None]
+        return out.astype(q.dtype)
 
     def _grouped_softmax(self, q: mx.array, values: mx.array, ok: mx.array) -> mx.array:
         """q [n, H, D] over its own slots values [n, S, D] (valid ``ok`` [n, S]): [n, H, D] fp32."""
@@ -392,30 +455,34 @@ class MoE:
     """sqrt(softplus) router; the top 6 of score + bias, renormalised x 1.5; FP8-in mxfp4 experts and a shared one."""
 
     def __init__(self, gate_w: mx.array, bias: mx.array, w1: Experts, w3: Experts, w2: Experts, s1: Linear,
-                 s3: Linear, s2: Linear, top: int, scale: float, limit: float) -> None:
+                 s3: Linear, s2: Linear, top: int, scale: float, limit: float, bias_vl: mx.array | None = None) -> None:
         self.router = gate_w.astype(mx.float32)
         self.bias = bias.astype(mx.float32)
+        self.bias_vl = None if bias_vl is None else bias_vl.astype(mx.float32)     # image rows' routing bias
         self.w1, self.w3, self.w2 = w1, w3, w2
         self.s1, self.s3, self.s2 = s1, s3, s2
         self.top, self.scale, self.limit = int(top), float(scale), float(limit)
 
     def arrays(self) -> list[mx.array]:
-        out = [self.router, self.bias]
+        out = [self.router, self.bias] + ([self.bias_vl] if self.bias_vl is not None else [])
         for e in (self.w1, self.w3, self.w2, self.s1, self.s3, self.s2):
             out += e.arrays()
         return out
 
-    def route(self, x: mx.array) -> tuple[mx.array, mx.array]:
+    def route(self, x: mx.array, image_mask: mx.array | None = None) -> tuple[mx.array, mx.array]:
         raw = KV.matmul(x.astype(mx.float32), self.router, mx.float32)
         scores = mx.sqrt(mx.logaddexp(raw, mx.array(0.0)))
-        idx = mx.argsort(-(scores + self.bias), axis=-1)[:, :self.top]
+        bias = self.bias
+        if image_mask is not None and self.bias_vl is not None:
+            bias = mx.where(image_mask[:, None], self.bias_vl, bias)
+        idx = mx.argsort(-(scores + bias), axis=-1)[:, :self.top]
         w = mx.take_along_axis(scores, idx, -1)
         if self.top > 1:
             w = w / (mx.sum(w, -1, keepdims=True) + 1e-20)
         return idx, w * self.scale
 
-    def __call__(self, x: mx.array) -> mx.array:
-        idx, w = self.route(x)
+    def __call__(self, x: mx.array, image_mask: mx.array | None = None) -> mx.array:
+        idx, w = self.route(x, image_mask)
         xq = fp8(x)
         rows, k = int(x.shape[0]), self.top
         sort = idx.size >= 64 and not KV.rows_mode()          # unsorted gathers keep each row's own bits
@@ -459,12 +526,29 @@ class Block:
                  shared: dict[str, Any]) -> tuple[mx.array, mx.array]:
         """One stream's rows: streams h [L, 4, D] and the pre-mix carried in [L, 4]; the new streams and pre-mix."""
 
+        return self.streams(h, pre, [caches], [start], [int(h.shape[0])], [shared])
+
+    def streams(self, h: mx.array, pre: mx.array, caches: list[list[LayerCache]], starts: list[int],
+                lengths: list[int], shared: list[dict[str, Any]],
+                image_mask: mx.array | None = None) -> tuple[mx.array, mx.array]:
+        """Several streams' rows in one pass; only attention's cache work runs stream by stream."""
+
         ap, ao, ac = self.attn_hc(h)
-        a = self.attn(KV.hc_pre_norm(h, pre, self.attn_norm, self.eps), caches, start, shared)
+        a = self.attn.streams(KV.hc_pre_norm(h, pre, self.attn_norm, self.eps), caches, starts, lengths, shared)
         h = KV.hc_post(a, h, ao, ac)
         fp, fo, fc = self.ffn_hc(h)
-        m = self.moe(KV.hc_pre_norm(h, ap, self.ffn_norm, self.eps))
+        m = self.moe(KV.hc_pre_norm(h, ap, self.ffn_norm, self.eps), image_mask)
         return KV.hc_post(m, h, fo, fc), fp
+
+
+def _spans(lengths: Any) -> list[tuple[int, int]]:
+    """Each stream's (first row, rows) in a forward's concatenated rows."""
+
+    out, at = [], 0
+    for n in lengths:
+        out.append((at, int(n)))
+        at += int(n)
+    return out
 
 
 class _nothing:
@@ -500,8 +584,22 @@ class DeepSeekV41:
     def embed_tokens(self, ids: mx.array) -> mx.array:
         return self.embed[ids]
 
-    def hidden(self, tokens: Any, cache: list[Any]) -> mx.array:
-        return self.hidden_rows(tokens, [cache])
+    def hidden(self, tokens: Any, cache: list[Any], inputs_embeds: mx.array | None = None) -> mx.array:
+        return self.hidden_rows(tokens, [cache], inputs_embeds=inputs_embeds)
+
+    def prefetch_prompt(self, tokens: Any, begin: int, end: int) -> None:
+        """Start reading the Engram pages prompt rows [begin, end) will look up, while earlier rows compute."""
+
+        if self.hasher is None or end <= begin or not ENGRAM_WARM:
+            return
+        from tensorfold.families.deepseek_v41.engram import warm
+
+        before = np.asarray([int(t) for t in tokens[max(0, begin - self.hasher.depth):begin]], dtype=np.int64)
+        rows = self.hasher(np.asarray([int(t) for t in tokens[begin:end]], dtype=np.int64),
+                           self.hasher.history(before, begin))
+        for i, layer in enumerate(self.layers):
+            if layer.engram is not None:
+                warm(layer.engram.table, rows[:, self.args.engram_layer_ids.index(i)])
 
     def _lookups(self, ids: np.ndarray, cache: LayerCache, start: int) -> np.ndarray | None:
         """A stream's rows' Engram lookups [L, tables, depth * heads] (its token ring takes the rows)."""
@@ -516,8 +614,12 @@ class DeepSeekV41:
         cache.write_tokens(mx.array(ids.astype(np.int32)), start)
         return rows
 
-    def hidden_rows(self, tokens: Any, caches: list[list[Any]], lengths: Any = None) -> mx.array:
-        """Several streams' rows in one forward, each row with its own call's bits; a prompt chunk is one stream's."""
+    def hidden_rows(self, tokens: Any, caches: list[list[Any]], lengths: Any = None,
+                    inputs_embeds: mx.array | None = None) -> mx.array:
+        """Several streams' rows in one forward, each row with its own call's bits; a prompt chunk is one stream's.
+
+        inputs_embeds [1, L, D] (one stream: an image prompt's chunk) replaces the token embeddings; its image
+        rows route with the VL bias and take no Engram contribution."""
 
         ids = mx.array(tokens).reshape(-1).astype(mx.uint32)
         host = np.array(ids).astype(np.int64)
@@ -533,24 +635,21 @@ class DeepSeekV41:
         for c, n, s in zip(caches, lengths, starts):
             lookups.append(self._lookups(host[at:at + n], c[0], s))
             at += n
-        h = self.embed_tokens(ids)
+        if inputs_embeds is not None and len(lengths) != 1:
+            raise ValueError("hidden_rows: image embeddings come one stream at a time")
+        h = self.embed_tokens(ids) if inputs_embeds is None else inputs_embeds.reshape(rows, -1)
+        image_mask = (ids == cfg.image_token_id) if inputs_embeds is not None else None
         x = mx.contiguous(mx.broadcast_to(h[:, None, :], (rows, cfg.hc_mult, h.shape[-1])))
         pre = mx.broadcast_to((mx.arange(cfg.hc_mult) == 0).astype(mx.float32), (rows, cfg.hc_mult))
-        # the work units: each stream's rows (decode rows take the row kernels: each row its one-row bits)
-        units = []
-        at = 0
-        for s, n in enumerate(lengths):
-            units.append((s, at, 0, n))
-            at += n
-        shared: list[dict[str, Any]] = [{} for _ in units]
-        hs = [x[a:a + n] for _, a, _, n in units]
-        pres = [pre[a:a + n] for _, a, _, n in units]
-        taps: list[list[mx.array]] = [[] for _ in units]
+        found = [lk for lk in lookups if lk is not None]
+        rows_lookups = (np.concatenate(found) if len(found) > 1 else found[0]) if found else None
+        shared: list[dict[str, Any]] = [{} for _ in lengths]
+        taps: list[mx.array] = []
+        # every stream's rows through each layer at once (decode rows take the row kernels: each row its one-row bits)
         with KV.decode_rows() if decode else _nothing():
-            x, pre = self._layers(lookups, hs, pres, taps, units, shared, caches, lengths, starts)
+            x, pre = self._layers(rows_lookups, x, pre, taps, shared, caches, lengths, starts, image_mask)
             self.last_streams = x
-            self.last_taps = (mx.concatenate([mx.concatenate(t, axis=-1) for t in taps]) if self.tap_layers
-                              else None)
+            self.last_taps = mx.concatenate(taps, axis=-1) if self.tap_layers else None
             if decode and not KV.metal():
                 normed = [rms(hc_pre(x[r:r + 1], pre[r:r + 1]), self.norm, cfg.rms_norm_eps) for r in range(rows)]
                 self.last_normed = mx.concatenate(normed) if rows > 1 else normed[0]
@@ -558,25 +657,39 @@ class DeepSeekV41:
                 self.last_normed = rms(hc_pre(x, pre), self.norm, cfg.rms_norm_eps)
         return self.last_normed[None]
 
-    def _layers(self, lookups: list[Any], hs: list[mx.array], pres: list[mx.array], taps: list[list[mx.array]],
-                units: list[tuple[int, int, int, int]], shared: list[dict[str, Any]], caches: list[list[Any]],
-                lengths: tuple[int, ...], starts: list[int]) -> tuple[mx.array, mx.array]:
+    def _layers(self, lookups: np.ndarray | None, h: mx.array, pre: mx.array, taps: list[mx.array],
+                shared: list[dict[str, Any]], caches: list[list[Any]], lengths: tuple[int, ...],
+                starts: list[int], image_mask: mx.array | None = None) -> tuple[mx.array, mx.array]:
         cfg = self.args
+        # MLX's CPU ops can round a row differently beside other rows: there each stream takes its own pass
+        joint = KV.metal() or len(lengths) == 1
+        if lookups is not None and joint and ENGRAM_AHEAD:     # every Engram layer's file reads start now
+            from tensorfold.families.deepseek_v41.engram import start_read
+
+            reads = {i: start_read(layer.engram.table, lookups[:, cfg.engram_layer_ids.index(i)])
+                     for i, layer in enumerate(self.layers) if layer.engram is not None}
+        else:
+            reads = {}
         for i, layer in enumerate(self.layers):
-            for u, (s, a, j, n) in enumerate(units):
-                if layer.engram is not None:
-                    k = cfg.engram_layer_ids.index(i)
-                    hs[u] = layer.engram(hs[u], lookups[s][j:j + n, k])
-                if i in self.tap_layers:
-                    taps[u].append(mx.mean(hs[u], axis=1))
-                hs[u], pres[u] = layer(hs[u], pres[u], caches[s], starts[s] + j, shared[u])
+            if layer.engram is not None:
+                k = cfg.engram_layer_ids.index(i)
+                if i in reads:
+                    mx.async_eval(h, pre)                    # the GPU runs the layers before while the read finishes
+                h = layer.engram(h, reads.get(i, lookups[:, k]), image_mask) if joint else mx.concatenate(
+                    [layer.engram(h[a:a + n], lookups[a:a + n, k]) for a, n in _spans(lengths)])
+            if i in self.tap_layers:
+                taps.append(mx.mean(h, axis=1))
+            if joint:
+                h, pre = layer.streams(h, pre, caches, starts, list(lengths), shared, image_mask)
+            else:
+                parts = [layer.streams(h[a:a + n], pre[a:a + n], [caches[b]], [starts[b]], [n], [shared[b]])
+                         for b, (a, n) in enumerate(_spans(lengths))]
+                h, pre = mx.concatenate([p[0] for p in parts]), mx.concatenate([p[1] for p in parts])
             for c, n, st in zip(caches, lengths, starts):
                 c[i].offset = st + n
             if (i + 1) % 2 == 0 and i + 1 < len(self.layers):
-                mx.async_eval(*hs, *pres)
-        x = mx.concatenate(hs) if len(hs) > 1 else hs[0]
-        pre = mx.concatenate(pres) if len(pres) > 1 else pres[0]
-        return x, pre
+                mx.async_eval(h, pre)
+        return h, pre
 
     def head(self, hidden: mx.array) -> mx.array:
         """Logits in fp32 (bf16 head, fp32 accumulation), each decode row on its own."""

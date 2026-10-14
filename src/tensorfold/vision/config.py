@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 
-FAMILIES = ('qwen3_5', 'qwen4_exp', 'glm5_next')     # the Qwen3.5/3.8 dense models, and Flash Next (same tower) on CUDA
+FAMILIES = ('qwen3_5', 'qwen4_exp', 'glm5_next', 'deepseek_v41')   # + Flash Next (same tower) on CUDA
 
 
 def validate_vision_config(config, family):
     if family not in FAMILIES:
-        raise ValueError('--vision supports GLM-5.3-Flash, Flash Next and Qwen3.5/3.8 dense checkpoints '
+        raise ValueError('--vision supports GLM-5.3-Flash, DeepSeek-V4.1-Flash, Flash Next and Qwen3.5/3.8 dense '
+                         'checkpoints '
                          'with their vision tower')
     vision = config.get('vision_config')
     text = config.get('text_config', config)
@@ -21,4 +22,6 @@ def validate_vision_config(config, family):
         tokens = ('image_token_id', 'image_start_token_id', 'image_end_token_id')
         if config.get('model_type') != 'glm5_next' or not all(key in config for key in tokens):
             raise ValueError('this GLM checkpoint is missing native image-token configuration')
+    if family == 'deepseek_v41' and 'image_token_id' not in config:
+        raise ValueError('this DeepSeek-V4.1 checkpoint is missing its image_token_id')
     return vision

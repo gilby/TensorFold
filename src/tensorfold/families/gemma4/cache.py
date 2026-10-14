@@ -1,4 +1,4 @@
-"""Gemma 4's KV caches: a ring for sliding-window layers, a growing buffer for full ones, decode writes alternating."""
+"""Gemma 4's KV caches: a ring for sliding-window layers, a growing buffer written in place for full ones."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Any
 import mlx.core as mx
 from mlx_lm.models.base import create_causal_mask
 
-from tensorfold.engine.alternating_kv import AlternatingKVCache
+from tensorfold.engine.inplace_kv import InplaceKVCache
 
 # a window's rows never overwrite a key a kept row still reads while the ring holds window + WINDOW_ROWS slots
 WINDOW_ROWS = 128
@@ -23,16 +23,10 @@ def _slot(index: int) -> mx.array:
     return found
 
 
-class LinearKVCache(AlternatingKVCache):
+class LinearKVCache(InplaceKVCache):
     """A full-attention layer's keys and values, [1, Hk, capacity, D] from position 0."""
 
     ring = 0
-
-    def write(self, keys: mx.array, values: mx.array) -> tuple[mx.array, mx.array]:
-        """Decode rows [1, Hk, n, D] at positions offset ..: the whole buffers after the write."""
-
-        self.update_and_fetch(keys, values)
-        return self.keys, self.values
 
 
 class RingKVCache:

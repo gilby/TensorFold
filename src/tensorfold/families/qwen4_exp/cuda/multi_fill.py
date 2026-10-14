@@ -40,7 +40,7 @@ class PromptPasses:
         return pass_limit(self.prefill_rows, live, self.share, self.round_s, self.row_s, PASS_MIN)
 
     def _waiting_request(self) -> bool:
-        """Both ranks use the leader's sampled arrival decision; one GPU reads its queue directly."""
+        """Every rank uses the leader's sampled arrival decision; one GPU reads its queue directly."""
 
         paired = getattr(self, "link", None) is not None or getattr(self, "follower", None) is not None
         return self.fill_yield if paired else self.arrived()

@@ -110,12 +110,14 @@ def models(tiny):
     return single, ranks
 
 
-def test_width_shares_are_whole_groups_lower_ranks_first():
-    assert [vk.share(640, r, 4) for r in range(4)] == [(0, 192), (192, 384), (384, 512), (512, 640)]
+def test_width_shares_are_whole_halves_lower_ranks_first():
+    assert [vk.share(640, r, 4) for r in range(4)] == [(0, 160), (160, 320), (320, 480), (480, 640)]
     assert [vk.share(640, r, 2) for r in range(2)] == [(0, 320), (320, 640)]
-    assert [vk.share(320, r, 4) for r in range(4)] == [(0, 128), (128, 192), (192, 256), (256, 320)]
-    with pytest.raises(ValueError, match="no 64-wide block"):
-        vk.share(192, 3, 4)
+    assert [vk.share(512, r, 4) for r in range(4)] == [(0, 128), (128, 256), (256, 384), (384, 512)]
+    assert [vk.share(320, r, 4) for r in range(4)] == [(0, 96), (96, 192), (192, 256), (256, 320)]
+    assert [vk.share(640, r, 4, vk.GROUP) for r in range(4)] == [(0, 192), (192, 384), (384, 512), (512, 640)]
+    with pytest.raises(ValueError, match="no 32-wide block"):
+        vk.share(96, 3, 4)
 
 
 def _tensor(model_dir: Path, name: str) -> torch.Tensor:

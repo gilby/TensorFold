@@ -133,6 +133,7 @@ class AbsoluteGrowthTests(unittest.TestCase):
         self.dec.solo, self.dec.solo_on, self.dec.planning = None, False, False
         self.dec.link, self.dec.follower = None, None
         self.dec.prefill_rows, self.dec.points, self.dec.vision = 4096, None, None
+        self.dec.tight, self.dec.no_grow = None, False       # class attributes the extraction drops
         live = torch_live(self.torch, capacity.available_bytes)
         self.dec.memory_gate = MemoryGate(live(), reserve=2 * GIB, live=live)
 

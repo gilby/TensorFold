@@ -313,6 +313,7 @@ class FlashNextEngine:
             rule += f", or up to {self.depth} copy drafts where the reply repeats earlier text"
         where = (f"up to {streams} streams, each growing to {self.context_window} prompt/reply tokens while memory "
                  f"lasts ({self.multi.memory_gate.room / 2**30:.1f} GiB free for their caches, "
+                 f"{self.multi.memory_gate.reserve / 2**30:.2f} GiB of it kept back, "
                  f"{self.multi.window_bytes / 2**30:.2f} GiB for one at the full window), eager" if self.concurrent else
                  f"{self.context_window}-token prompt/reply window; {self.max_len}-token cache")
         if ple_on_ssd:

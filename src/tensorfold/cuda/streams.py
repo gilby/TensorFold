@@ -34,6 +34,7 @@ class Stream:
     owed: list[int] = field(default_factory=list)         # a replay's tokens sent before it gave way: checked, not resent
     error: Exception | None = None                        # why a stream ended without finishing
     waiting: bool = False                                 # held out of rounds until its caches can grow
+    preempted: bool = False                               # gave way for memory: replayed later, not answered now
     done: bool = False
     rounds: int = 0
     min_rows: int = 0

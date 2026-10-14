@@ -10,7 +10,7 @@ import torch
 from tensorfold.cuda.logprobs import capture
 
 from tensorfold.cuda.capacity import LIMIT_ENV, available_bytes, cuda_limit_bytes
-from tensorfold.cuda.memory_gate import MemoryGate, NoRoom, torch_live
+from tensorfold.cuda.memory_gate import RESERVE_MARGIN, MemoryGate, NoRoom, reserve_bytes, torch_live
 from tensorfold.cuda.markers import MIN_GAP
 from tensorfold.cuda.sampling import sample_streams
 from tensorfold.cuda.streams import Stream, accept
@@ -48,6 +48,9 @@ def _slot(w, st: State, buf: Buffers, mbuf: Buffers, pbuf: Buffers, capacity: in
 class MultiDecoder(TwoRanks, Alone, PromptPasses):
     """Rounds over the live streams; ``slots`` streams at most, each with ``capacity`` tokens of context."""
 
+    tight = None                                     # planning within the fullest rank's (free bytes, gate room)
+    no_grow = False                                  # planning a round in which no cache grows
+
     def __init__(self, w, *, slots: int, capacity: int, depth: int = DEPTH, confidence: float = CONFIDENCE,
                  stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS,
                  share: float = SHARE, points=None, graphs: bool = True, vision=None, workspace_bytes: int = 0,
@@ -81,8 +84,10 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         free = torch_live(torch, available_bytes) if torch.cuda.is_available() else None
         # the mapped n-gram tables are not held back (they barely fit on a Spark); lookups page from disk instead
         live = free
-        self.memory_gate = MemoryGate(
-            live() if live is not None else 1 << 62, reserve=max(2 * GIB, workspace_bytes), live=live)
+        unified = (not torch.cuda.is_available()
+                   or bool(torch.cuda.get_device_properties(torch.cuda.current_device()).is_integrated))
+        reserve, self.reserve_measured = reserve_bytes(workspace_bytes, unified)
+        self.memory_gate = MemoryGate(live() if live is not None else 1 << 62, reserve=reserve, live=live)
         self.streams: dict[int, Stream] = {}
         self.filling: list[Stream] = []                  # admitted, prompts still prefilling (oldest first)
         self.fills: dict[int, list] = {}                 # stream id -> [its engine, drafts?, next row, kept state]
@@ -105,6 +110,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
 
         if rows <= st.capacity or st.capacity >= st.limit:       # admission's count keeps a stream within its window
             return True
+        if self.no_grow:
+            return False
         size = min(st.limit, -(-rows // STEP) * STEP)
         if self._is_solo(st):                    # each resize recaptures its graphs: double, so they rarely do
             size = min(st.limit, max(size, 1 << (st.capacity - 1).bit_length() + 1))
@@ -125,6 +132,11 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                                 f"{LIMIT_ENV}={limit / GIB:g}: the estimated copy peak is {peak / GIB:.2f} GiB. "
                                 "Shorten the prompt or max_tokens, reduce --context or --parallel, or raise "
                                 f"{LIMIT_ENV} if more GPU memory is available.")
+                    if self.tight is not None and self.memory_gate.live() < grow + st.layer_bytes(size):
+                        if self.filling:
+                            return False
+                        raise NoRoom(f"Growing this request's attention caches to {size} tokens does not fit the "
+                                     "fullest GPU even alone. Shorten the prompt or max_tokens, or reduce --context.")
                     break
                 return False
         self._state_changed(st)
@@ -189,12 +201,10 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                 ended.append(s)                          # finish() releases only this request's slot
                 continue
             blocked = blocked or s.waiting
-        if live and live[0].waiting and len(live) > 1:        # even the oldest can't grow: the newest ends
+        if live and live[0].waiting and len(live) > 1 and not self.no_grow:
+            # even the oldest can't grow: the newest gives way, replayed from its prompt once memory frees
             newest = live[-1]
-            newest.error = RuntimeError(
-                f"This server ran out of memory with {len(live)} streams decoding, so the newest (this request, after "
-                f"{len(newest.out)} tokens) was stopped for the older ones to finish. Retry it, shorten the prompt or "
-                "max_tokens, or start the server with a smaller --parallel.")
+            newest.preempted = True
             newest.done, newest.waiting = True, False
             self.memory_gate.ends += 1
             self.streams.pop(newest.sid, None)
@@ -227,6 +237,12 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         """Warm a full prompt chunk, a cut partial chunk, drafts and a shared round, then discard their state."""
 
         self.solo_on = False
+        measure = self.reserve_measured and torch.cuda.is_available()
+        if measure:                                  # the prompt pass and round's transients above their caches
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            base, held = torch.cuda.memory_allocated(), self.memory_gate.held
+            self.memory_gate.peak = held
         try:
             s = Stream([0] * min(self.prefill_rows + WARM_TAIL + 1, self.capacity - self.depth - 2), 2)
             self.admit(s)
@@ -239,6 +255,10 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                 self.free.append(s.st)
         finally:
             self.solo_on = self.solo is not None
+        if measure:
+            torch.cuda.synchronize()
+            transient = torch.cuda.max_memory_allocated() - base - (self.memory_gate.peak - held)
+            self.memory_gate.reserve = max(self.memory_gate.reserve, int(transient) + RESERVE_MARGIN)
         if self.solo is not None:                    # last: the graph slot's rows are the ones requests will find
             self.solo.graphs.warm(self.depth + 1)
             self.solo.st.reset(self.w)               # the captures wrote its state

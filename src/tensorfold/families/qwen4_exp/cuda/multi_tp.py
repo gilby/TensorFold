@@ -12,6 +12,9 @@ from tensorfold.cuda.capacity import gather_ints
 from tensorfold.cuda.memory_gate import NoRoom
 from tensorfold.cuda.streams import Stream
 
+TOO_LONG = "the prompt cannot fit available memory; shorten it or lower the server context"
+
+
 class Link:
     """Rank 0's ordered steps to every other rank over TCP or the rendezvous store; followers wait outside collectives."""
 
@@ -135,20 +138,27 @@ class TwoRanks:
         return next(i for i, x in enumerate(self.slots) if x is st)
 
     def _agree(self, what: str, plan: list, checks: tuple = ()):
-        """One small all-gather checks the whole step before either rank enters its model collectives."""
+        """One small all-gather checks the whole step before either rank enters its model collectives; it also
+        carries each rank's free bytes and gate room, so a plan the fullest rank refused is redone within them."""
 
         if self.w.comm is None:
             return tuple(bool(value) for value in checks)
         digest = int.from_bytes(hashlib.sha256(json.dumps(plan).encode()).digest()[:8], "big", signed=True)
-        width, world = 1 + len(checks), int(getattr(self.w.comm, "world", 2))
-        ranks = gather_ints(torch, self.w.comm.all_gather, [digest, *map(int, checks)], world)
+        gate = getattr(self, "memory_gate", None)
+        room = [0, 0]
+        if gate is not None:
+            free = gate.live() if gate.live is not None else 1 << 62
+            room = [int(free) - gate.reserve, gate.room - gate.reserve - gate.held]
+        width, world = 3 + len(checks), int(getattr(self.w.comm, "world", 2))
+        ranks = gather_ints(torch, self.w.comm.all_gather, [digest, *room, *map(int, checks)], world)
         if len(ranks) != world or any(len(rank) != width for rank in ranks):
             raise OutOfStep("the shared plan check returned an invalid rank count")
+        self.tightest = (min(rank[1] for rank in ranks), min(rank[2] for rank in ranks))
         odd = next((r for r in range(1, world) if ranks[r][0] != ranks[0][0]), None)
         if odd is not None:
             raise OutOfStep(f"rank {odd} planned a different {what} from rank 0; the requests in it fail, serving goes on")
         # every check holds on every rank: a cache growth fits only when it fits the fullest rank
-        return tuple(all(bool(rank[index]) for rank in ranks) for index in range(1, width))
+        return tuple(all(bool(rank[index]) for rank in ranks) for index in range(3, width))
 
     def _joined_ranks(self) -> None:
         """A client may leave at its first token; both ranks then make the same next prompt-pass decision."""
@@ -174,28 +184,39 @@ class TwoRanks:
     def _prepare_admission(self, s, told):
         from .multi_plan import admission, apply, ready
 
-        plan = admission(self, s) if told is None else told
-        slot, cached = plan["slot"], plan["cached"]
-        source = plan["resume_slot"]
-        resume = next(({"state": k[2], "tail": k[3]} for k in self.kept
-                       if self._index(k[1]) == source and len(k[0]) == cached and s.prompt[:cached] == k[0]), None)
-        valid = 0 <= slot < len(self.slots) and (cached == 0 or resume is not None)
-        # an image prompt: both ranks agree on its rows, decode offset and feature shape before the tensors cross
+        # an image prompt: the ranks agree on its rows, decode offset and feature shape before the tensors cross
         vision = getattr(s, "vision", None)
         images = None if vision is None else vision if isinstance(vision, dict) else {
             "rows": [int(r) for r in vision.rows], "delta": int(vision.rope_delta),
             "shape": [int(n) for n in vision.features.shape]}
-        if self.link is not None:
-            self.link.send(["admit", self.next_id, list(s.prompt), s.count, _pack(s.sampling), bool(s.draft),
-                            bool(s.stop_eos), bool(s.background), plan, images])
-        valid, fits = self._agree("admission", [shape(self), plan, list(s.prompt), s.count, _pack(s.sampling),
-                                               bool(s.draft), bool(s.stop_eos), bool(s.background), images],
-                                  (valid, ready(self, plan)))
-        if not valid:
-            raise OutOfStep("the agreed prefix is not available on every rank")
+        # a plan some rank refuses is planned again within the fullest rank's memory; followers replay each attempt
+        for attempt in range(1 if told is not None or self.w.comm is None else 2):
+            if told is not None or attempt == 0:
+                plan = told if told is not None else admission(self, s)
+            else:
+                try:
+                    plan = admission(self, s, tight=self.tightest)
+                except NoRoom:                           # alone, it does not fit the fullest rank at all
+                    raise ValueError(TOO_LONG) from None
+            slot, cached = plan["slot"], plan["cached"]
+            source = plan["resume_slot"]
+            resume = next(({"state": k[2], "tail": k[3]} for k in self.kept
+                           if self._index(k[1]) == source and len(k[0]) == cached and s.prompt[:cached] == k[0]),
+                          None)
+            valid = 0 <= slot < len(self.slots) and (cached == 0 or resume is not None)
+            if self.link is not None:
+                self.link.send(["admit", self.next_id, list(s.prompt), s.count, _pack(s.sampling), bool(s.draft),
+                                bool(s.stop_eos), bool(s.background), plan, images])
+            valid, fits = self._agree("admission", [shape(self), plan, list(s.prompt), s.count, _pack(s.sampling),
+                                                   bool(s.draft), bool(s.stop_eos), bool(s.background), images],
+                                      (valid, ready(self, plan)))
+            if not valid:
+                raise OutOfStep("the agreed prefix is not available on every rank")
+            if fits:
+                break
         if not fits:
             if not self.streams and not self.filling:
-                raise ValueError("the prompt cannot fit available memory; shorten it or lower the server context")
+                raise ValueError(TOO_LONG)
             raise NoRoom("the proposed prompt cache growth does not fit on every rank")
         if images is not None:                       # every rank reaches this point or none does
             s.vision = self._share_vision(s, images)
@@ -220,10 +241,15 @@ class TwoRanks:
     def _prepare_round(self, told):
         from .multi_plan import apply, ready, round_plan
 
-        plan = round_plan(self) if told is None else told
-        if self.link is not None:
-            self.link.send(["round", [s.sid for s in [*self.streams.values(), *self.filling] if s.done], plan])
-        (fits,) = self._agree("round", [shape(self), plan], (ready(self, plan),))
+        # a refused growth is planned again within the fullest rank's memory, then with none (streams needing rows wait)
+        for attempt in range(1 if told is not None or self.w.comm is None else 3):
+            plan = told if told is not None else round_plan(self) if attempt == 0 else \
+                round_plan(self, tight=self.tightest, grow=attempt == 1)
+            if self.link is not None:
+                self.link.send(["round", [s.sid for s in [*self.streams.values(), *self.filling] if s.done], plan])
+            (fits,) = self._agree("round", [shape(self), plan], (ready(self, plan),))
+            if fits:
+                break
         if not fits:
             raise NoRoom("the proposed round cache growth does not fit on every rank")
         ended = [self.streams[sid] for sid in plan["ended"]]
@@ -249,7 +275,9 @@ class TwoRanks:
                 s.vision = op[9] if len(op) > 9 else None    # an image prompt's rows, delta and feature shape
                 try:
                     self.admit(s, told=plan)
-                except (ValueError, NoRoom, OutOfStep) as exc:
+                except NoRoom:
+                    pass                                 # the leader waits and asks again
+                except (ValueError, OutOfStep) as exc:
                     print(f"[tensorfold] rank {link.rank}: stream {sid} refused: {exc}", flush=True)
             elif op[0] == "round":
                 for s in [*self.streams.values(), *self.filling]:
@@ -257,6 +285,8 @@ class TwoRanks:
                         s.done = True
                 try:
                     finished.update({s.sid: s for s in self.round(told=op[2])})
+                except NoRoom:
+                    pass                                 # a refused attempt: the leader sends the next plan
                 except Exception as exc:                 # rank 0 drops the same failed round
                     print(f"[tensorfold] rank {link.rank}: a round failed: {exc}", flush=True)
             elif op[0] == "finish":

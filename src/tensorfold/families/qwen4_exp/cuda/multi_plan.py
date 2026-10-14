@@ -45,11 +45,13 @@ class Shadow:
         self.pos, self.mtp_len = other.pos, other.mtp_len
 
 
-def view(dec):
-    """A host-only view runs the existing admission and memory policy, recording its slot operations."""
+def view(dec, tight=None, grow=True):
+    """A host-only view runs the existing admission and memory policy, recording its slot operations; ``tight``:
+    plan within the fullest rank's (free bytes, gate room) instead of this rank's; ``grow`` False: no cache grows."""
 
     p = copy.copy(dec)
     p.planning, p.actions = True, []
+    p.tight, p.no_grow = tight, not grow
     p.slots = [Shadow(st, i, p.actions) for i, st in enumerate(dec.slots)]
     slots = {id(st): p.slots[i] for i, st in enumerate(dec.slots)}
     def stream(s):
@@ -65,7 +67,12 @@ def view(dec):
     p.kept = [(ids, slots[id(st)], snap, tail) for ids, st, snap, tail in dec.kept]
     p.held = {sid: list(rows) for sid, rows in dec.held.items()}
     p.memory_gate = copy.copy(dec.memory_gate)
-    if dec.memory_gate.live is not None:
+    if tight is not None:
+        free, spare = tight
+        held = p.memory_gate.held
+        p.memory_gate.reserve, p.memory_gate.room = 0, held + spare
+        p.memory_gate.live = lambda: free - (p.memory_gate.held - held)
+    elif dec.memory_gate.live is not None:
         free, held = dec.memory_gate.live(), dec.memory_gate.held
         p.memory_gate.live = lambda: free - (p.memory_gate.held - held)
     if dec.solo is not None:
@@ -82,11 +89,12 @@ def layout(p) -> dict:
             "streams": [[s.sid, s.st.index, bool(s.waiting), bool(s.done), str(s.error) if s.error else None]
                         for s in p.all_streams],
             "live": list(p.streams), "held": [[sid, rows] for sid, rows in p.held.items()],
-            "waits": p.memory_gate.waits, "ends": p.memory_gate.ends, "passed": sorted(p.passed.items())}
+            "waits": p.memory_gate.waits, "ends": p.memory_gate.ends, "passed": sorted(p.passed.items()),
+            "preempted": [s.sid for s in p.all_streams if getattr(s, "preempted", False)]}
 
 
-def admission(dec, s) -> dict:
-    p = view(dec)
+def admission(dec, s, *, tight=None) -> dict:
+    p = view(dec, tight)
     text = getattr(s, "vision", None) is None            # image prompts reuse no kept prefix (as on one GPU)
     st, resume, cached = p._slot_for(list(s.prompt), s.draft and text)
     source = next((st.index for ids, st, snap, _ in p.kept
@@ -103,8 +111,8 @@ def admission(dec, s) -> dict:
     return {**layout(p), "slot": st.index, "cached": cached, "resume_slot": source, "error": error, "points": points}
 
 
-def round_plan(dec) -> dict:
-    p = view(dec)
+def round_plan(dec, *, tight=None, grow=True) -> dict:
+    p = view(dec, tight, grow)
     ended = [s.sid for s in p._make_room()]
     live = [s for s in p.streams.values() if not s.done and not s.waiting]
     solo = None
@@ -168,6 +176,8 @@ def apply(dec, plan):
         s = all_streams[sid]
         s.st, s.waiting, s.done = dec.slots[slot], waiting, done
         s.error = RuntimeError(error) if error else None
+    for sid in plan.get("preempted", ()):
+        all_streams[sid].preempted = True
     dec.streams = {sid: all_streams[sid] for sid in plan["live"]}
     dec.held = dict(plan["held"])
     dec.memory_gate.waits, dec.memory_gate.ends = plan["waits"], plan["ends"]

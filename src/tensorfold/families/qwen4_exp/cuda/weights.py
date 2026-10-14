@@ -52,7 +52,8 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
                       or (full.kv_heads % world and world % full.kv_heads)):
         raise ValueError(f"Flash Next's heads ({full.heads} query, {full.kv_heads} key/value, {full.nk}/{full.nv} "
                          f"DeltaNet) do not split over {world} ranks")
-    unit = vk.UNIT if full.quant == "modelopt" else 32            # whole NVFP4 groups of 64, MLX groups of 32
+    # whole NVFP4 groups of 64 (32-input halves on sm_70's expert kernels), MLX groups of 32
+    unit = (vk.UNIT if sm70 else vk.GROUP) if full.quant == "modelopt" else 32
     lo, hi = vk.share(full.moe_width, rank, world, unit) if world > 1 else (0, full.moe_width)   # shared expert too
     # key/value heads past the rank count are shared: each rank keeps the one its query heads read
     kv_local = max(1, full.kv_heads // world)

@@ -1,15 +1,36 @@
 """Requests submit from any thread; one worker thread runs the rounds, and a slow client only fills its own queue."""
 # Background requests go last; one decoding yields its lane to a waiting request and re-queues to replay later.
+# Requests memory can't hold yet wait in arrival order (MEMORY_WAIT_ENV caps the wait); one that gave way replays first.
 
 from __future__ import annotations
 
+import collections
 import itertools
+import os
 import queue
 import threading
+import time
 from typing import Any, Callable
 
 from .memory_gate import NoRoom
 from .streams import Stream
+
+MEMORY_WAIT_ENV = "TENSORFOLD_MEMORY_WAIT_S"
+MEMORY_WAIT_S = 900.0            # longest a request waits for memory before it is refused
+RETRY_S = 1.0                    # a waiting request is asked again this often when no stream has finished
+
+
+def memory_wait_s() -> float:
+    value = os.environ.get(MEMORY_WAIT_ENV, "").strip()
+    if not value:
+        return MEMORY_WAIT_S
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise ValueError(f"{MEMORY_WAIT_ENV}: seconds, not {value!r}") from None
+    if not seconds > 0:
+        raise ValueError(f"{MEMORY_WAIT_ENV}: a positive number of seconds, not {value!r}")
+    return seconds
 
 
 class Waiting(queue.PriorityQueue):
@@ -51,9 +72,13 @@ class Scheduler:
         self.decoder = decoder
         self.max_streams = max_streams
         self.waiting = Waiting()
-        self.held: tuple | None = None               # a request waiting for memory, admitted before any other
+        # requests waiting for memory, oldest first, admitted before any other: (stream, box, since)
+        self.parked: collections.deque = collections.deque()
+        self.wait_s = memory_wait_s()
+        self.retry_at = 0.0                          # when the first parked request is asked again
         self.boxes: dict[int, queue.Queue] = {}
         self.yields = 0                              # background streams that gave up their lane
+        self.preempted = 0                           # streams that gave way for memory and replay
         if hasattr(decoder, "arrived"):              # a decoder filling prompts lets a new request in between passes
             decoder.arrived = self.waiting.foreground
         self.thread = threading.Thread(target=self._loop, daemon=True)
@@ -114,31 +139,57 @@ class Scheduler:
             raise error
         return results
 
+    def _expire(self) -> None:
+        """Refuse parked requests that have waited ``wait_s``: a clear error now rather than a hung client."""
+
+        from tensorfold.server.errors import CapacityError
+
+        now = time.monotonic()
+        while self.parked and now - self.parked[0][2] > self.wait_s:
+            stream, box, since = self.parked.popleft()
+            box.put(("error", CapacityError(
+                f"this request waited {now - since:.0f} s for GPU memory while {self.decoder.live()} streams decoded "
+                f"({MEMORY_WAIT_ENV}={self.wait_s:g}); retry later, or shorten the prompt or max_tokens")))
+
     def _admit(self, first=None) -> list[Stream]:
         done = []
+        self._expire()
         while self.decoder.live() < self.max_streams:
+            parked = False
             if first is not None:
                 (stream, box), first = first, None
-            elif self.held is not None:
-                (stream, box), self.held = self.held, None
+                since = time.monotonic()
+            elif self.parked:
+                if time.monotonic() < self.retry_at:
+                    break                            # nothing freed since it was refused: ask again later
+                (stream, box, since), parked = self.parked[0], True
             else:
                 try:
                     stream, box = self.waiting.get_nowait()
                 except queue.Empty:
                     break
+                since = time.monotonic()
             self.boxes[id(stream)] = box
             try:
                 self.decoder.admit(stream)
             except NoRoom as exc:
                 self.boxes.pop(id(stream))
                 if self.decoder.live():              # waits, first in line, until a live stream finishes
-                    self.held = (stream, box)
+                    if not parked:
+                        self.parked.append((stream, box, since))
+                    self.retry_at = time.monotonic() + RETRY_S
                     break
+                if parked:
+                    self.parked.popleft()
                 box.put(("error", exc))
                 continue
             except Exception as exc:                 # noqa: BLE001  (this request fails, the others go on)
+                if parked:
+                    self.parked.popleft()
                 self.boxes.pop(id(stream)).put(("error", exc))
                 continue
+            if parked:
+                self.parked.popleft()
             if stream.done:
                 done.append(stream)
         return done
@@ -166,7 +217,7 @@ class Scheduler:
     def _loop(self) -> None:
         while True:
             self._yield()
-            idle = not self.decoder.live() and self.held is None
+            idle = not self.decoder.live() and not self.parked
             first = self.waiting.get() if idle else None                              # idle: wait for a request
             if idle and first is None:
                 return                                                                # close()
@@ -177,5 +228,17 @@ class Scheduler:
                 for s in self.decoder.drop():
                     self._reply(s, "error", exc)
             self.decoder.finish(done)
+            if done:
+                self.retry_at = 0.0                  # a stream finished: a parked request may fit now
+            replays = []
             for s in done:
+                if s.preempted and s.error is None:
+                    box = self.boxes.pop(id(s), None)
+                    if box is not None:              # its reply so far is owed, not resent: it replays first
+                        replays.append((s.continued(), box, time.monotonic()))
+                        self.preempted += 1
+                        print(f"[tensorfold] a stream gave way for memory after {len(s.out) + len(s.owed)} tokens; it "
+                              "replays from its prompt when a stream finishes", flush=True)
+                    continue
                 self._reply(s, *(("error", s.error) if s.error is not None else ("done", s.stats())))
+            self.parked.extendleft(reversed(replays))

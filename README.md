@@ -1,4 +1,64 @@
-# TensorFold
+# TensorFold (fleet fork of the Python engine)
+
+> **This is a fork of TensorFold's Python engine, which upstream froze at v0.6.6** (the `python-0.6` branch of
+> [ashhart/TensorFold](https://github.com/ashhart/TensorFold); new upstream work goes into the native Zig engine on
+> `main`). This fork's `main` is v0.6.6 plus the changes below, each merged as its own pull request
+> ([#1–#41](https://github.com/gilby/TensorFold/pulls?q=is%3Apr+is%3Amerged)). The release tag is `fleet-v0.6.6-1`.
+> Install it with `python -m pip install git+https://github.com/gilby/TensorFold.git@fleet-v0.6.6-1`. Work credited to
+> other contributors keeps their authorship in the commits.
+>
+> Where the text further down says a GPU below compute capability 8.9 is refused, this fork differs: it runs on Ampere
+> (8.0/8.6) and on Volta (7.0) as listed below.
+
+## Changes in this fork
+
+**GPU generations**
+- Ampere (sm_80/86): bf16 kernels from 8.0, FP8 prompts from 8.9, NVFP4 as W4A16 (#5).
+- Volta (sm_70): 4-bit matmuls, NVFP4 checkpoints including Qwen3.6 MoE experts, tensor-core prompt and verify
+  attention (#4, #13, #32).
+
+**Multi-GPU**
+- `--tp 4` for Qwen3.8-27B and Flash Next NVFP4 on sm_70; rank sums of two to eight ranks (#17).
+- Host-memory rank sums for GPUs without peer access, as reduce-scatter and all-gather overlapped with compute (#14, #31).
+- Flash Next `--parallel N` on four ranks; even sm_70 expert split, a measured cache reserve, and requests that wait for
+  memory instead of failing (#20, #23).
+- The 27B's DFlash2 drafter on four ranks (#30).
+
+**Qwen3.8-27B (CUDA)**
+- NVFP4 on two ranks, per-channel FP8 projections, compressed-tensors exports with FP8 KV scales (#14, #21).
+- `--kv-dtype int8`, on one GPU and on several ranks and sm_70, with caches that grow by use (#27, #28).
+- CUDA graphs for DFlash2 rounds and for several streams' tree-verify rounds on sm_70 (#15, #29).
+- Decision requests (`/v1/systemone`) with a runtime LoRA adapter and a joint schema head (Cloudflare Clef), on NVFP4 and
+  EXL3 packs and with images (#33, #40).
+
+**Qwen3.6 MoE**
+- CUDA: ModelOpt NVFP4 checkpoints and EXL3 packs; DFlash v1 and DSpark drafters with graphed draft steps; lane matmuls at
+  5, 6 and 8 bits and in groups of 32; MTP layers in mixed formats (#2, #3, #16).
+- Mac: any MLX affine layout; drafting with an MTP layer kept in the checkpoint's own shards; EXL3 packs through
+  row-exact trellis kernels (#1, #22, #24).
+
+**New Mac families**
+- DeepSeek-V4.1-Flash with its DSpark drafter, row-exact decode windows, shared multi-stream rounds, image input,
+  DeepSeek's own prompt encoder and DSML tool calls (#8, #9).
+- Gemma 4: the dense 31B layout and oQ mixed widths, Gemma 4 12B, Gemma 4 MTP assistant drafters, full-attention KV
+  written in place (#6, #7, #37, #38).
+- Laguna-S-2.1 on the lane engine with mixed-width oQ checkpoints and DFlash drafts (#10).
+
+**Mac kernels without tensor units (before M5)**
+- Each decode linear picks the matrix or the row kernels by format and shape, for GLM-5.3-Flash, Gemma 4 and Laguna
+  (#34, #35, #36).
+
+**Prompts and memory**
+- `--tail-checkpoint-tokens`: an edited last message resumes from a kept state instead of re-reading the prompt (#25).
+- `TENSORFOLD_PREFILL_ROWS` sets prompt chunk rows on Macs too (#39).
+- EXL3 prompt experts decode each weight tile once for up to 64 pairs; the EXL3 prompt GEMM steps K by 64 (#18, #26).
+- b16 verify windows share weight and row loads (#12).
+
+**Fixes**
+- Capacity reads the current device; DFlash2 configs without `target_layer_ids` (#11); admission without torch (#19);
+  v0.6.6 integration: group-folded tree attention slots, Flash Next's sm_70 floor, two-rank images (#41).
+
+---
 
 TensorFold serves language models on Apple Silicon and NVIDIA GPUs through an OpenAI-compatible API.
 Each model family supplies its own kernels and draft verification.

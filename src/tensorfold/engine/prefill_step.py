@@ -8,6 +8,19 @@ from typing import Any, Sequence
 CONTEXT_FLOOR = 131072
 
 
+def requested() -> int | None:
+    """Prompt chunk rows from TENSORFOLD_PREFILL_ROWS (256 to 16,384), or None: the family's own choice."""
+
+    import os
+
+    value = os.environ.get("TENSORFOLD_PREFILL_ROWS", "").strip()
+    if not value:
+        return None
+    if not value.isdecimal() or not 256 <= int(value) <= 16384:
+        raise ValueError(f"TENSORFOLD_PREFILL_ROWS: 256 to 16,384 rows, not {value!r}")
+    return int(value)
+
+
 def choose(make_engine: Any, steps: Sequence[int], budget: int, tokens: Sequence[int], window: int = 0) -> int:
     """Probe steps smallest first, a larger one only if its worst case fits; take the largest that leaves the floor."""
 
@@ -64,4 +77,4 @@ def choose(make_engine: Any, steps: Sequence[int], budget: int, tokens: Sequence
             return small
 
 
-__all__ = ["CONTEXT_FLOOR", "choose"]
+__all__ = ["CONTEXT_FLOOR", "choose", "requested"]

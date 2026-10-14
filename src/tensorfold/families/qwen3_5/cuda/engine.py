@@ -51,10 +51,6 @@ class Qwen27Engine:
         from tensorfold.cuda.kernels.kvpack import check as check_kv
 
         self.kv_dtype = check_kv(kv_dtype)
-        if self.kv_dtype != "bf16" and tp != 1:
-            raise ValueError(f"--kv-dtype {kv_dtype} runs on one GPU: two ranks keep the 27B's caches in bf16")
-        if self.kv_dtype != "bf16" and volta():
-            raise ValueError(f"--kv-dtype {kv_dtype} needs sm_80 or newer: the sm_70 attention kernel reads bf16 caches")
         bits = 8 if self.kv_dtype == "int8" else 16
         if nvfp4 and vision:
             raise ValueError("image input on CUDA is tested on the MLX checkpoint only: drop --vision for an NVFP4 "
@@ -88,7 +84,7 @@ class Qwen27Engine:
             # both ranks must run the same calls: refuse to start when they were given different settings
             flags = torch.tensor([int(draft_dir is not None and tp_draft), max_rows, int(split_head), int(allow_copy),
                                   streams, -1 if context is None else int(context), int(bool(context_explicit)),
-                                  int(vision), keep, int(trees_on), int(prompt_precision.fp8())],   # precision last
+                                  int(vision), keep, int(trees_on), bits, int(prompt_precision.fp8())],   # precision last
                                  dtype=torch.int64, device="cuda")
             both = torch.empty((tp, flags.numel()), dtype=torch.int64, device="cuda")
             dist.all_gather_into_tensor(both, flags)
@@ -100,7 +96,7 @@ class Qwen27Engine:
                                    f"head split, copies, --parallel, --context, --checkpoint-slots): rank 0 "
                                    f"{both[0].tolist()}, rank {odd} {both[odd].tolist()}; pull the draft model "
                                    "everywhere, and pass the same --no-drafts, --parallel, --context, "
-                                   "--checkpoint-slots and TF_TREE_GRAPHS to every rank")
+                                   "--checkpoint-slots, --kv-dtype and TF_TREE_GRAPHS to every rank")
             gather = lambda values: gather_ints(torch, lambda send, recv: dist.all_gather_into_tensor(recv, send), values,
                                                 tp)
             from tensorfold.cuda import p2p
@@ -117,7 +113,8 @@ class Qwen27Engine:
         # prompt chunks sized to the card (4096 rows from 80 GB), the verify scratch to the rows a round takes
         chunk = prompt_rows(total_bytes(torch), prompt_row_bytes(config(model_dir), tp))
         sized = dict(prompt_staging=volta(), kv_bits=bits)
-        geometry = ((lambda text: stream_geometry(text, tp, streams, keep, first=256 if tp == 1 else None, **sized)) if many
+        # several streams grow by use (one GPU or several ranks): one whole window and each stream's first rows
+        geometry = ((lambda text: stream_geometry(text, tp, streams, keep, first=256, **sized)) if many
                     else (lambda text: gdn_geometry(text, tp, max_rows, rows=max_rows, prompt=chunk, evicts=tp == 1, **sized)))
         # an affine checkpoint's packed words at their stored precision; an EXL3 pack's by its own format
         tensor_bytes = weight_transform(model_dir, one_gpu=tp == 1)
@@ -248,11 +245,16 @@ class Qwen27Engine:
                 if hasattr(self.draft, "graph_block"):
                     self.draft.graphs_on = True
             self.multi.calibrate(streams)
+            gate = self.multi.memory_gate
+            room = self.multi._room_gather() if tp > 1 else (gate.live() if gate is not None else 0)
+            window = self.multi.row_bytes * self.context_window
             if rank == 0:
-                print(f"[tensorfold] {streams} streams of {self.context_window} prompt/reply tokens, {keep} prompt "
-                      "states kept" if tp > 1 else
-                      f"[tensorfold] up to {streams} streams, each growing to {self.context_window} prompt/reply "
-                      f"tokens while memory lasts, {keep} prompt states kept", flush=True)
+                print(f"[tensorfold] up to {streams} streams, each growing to {self.context_window} prompt/reply "
+                      f"tokens while memory lasts, {keep} prompt states kept"
+                      + (f" ({room / 2**30:.1f} GiB free for their caches on the fullest rank, "
+                         f"{gate.reserve / 2**30:.2f} GiB of it kept back, {window / 2**30:.2f} GiB for one at the "
+                         f"full window: {max(0, room - gate.reserve) // max(1, window)} whole windows)"
+                         if gate is not None else ""), flush=True)
                 curve = ", ".join(f"{r}: {ms:.1f}" for r, ms in self.multi.costs)
                 print(f"[tensorfold] verify ms by rows (tree widths follow it): {curve}", flush=True)
                 self.scheduler = Scheduler(self.multi, max_streams=streams)

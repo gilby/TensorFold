@@ -251,7 +251,7 @@ def _volta_ext():
     from tensorfold.cuda.build import VOLTA, load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_attention_volta_v1", sources=[str(here / "attention_volta.cu")], need=VOLTA,
+    return load(name="tensorfold_attention_volta_v2", sources=[str(here / "attention_volta.cu")], need=VOLTA,
                 extra_cuda_cflags=["-O3", f"-I{here}"], verbose=False)
 
 

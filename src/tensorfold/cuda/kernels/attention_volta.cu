@@ -9,11 +9,17 @@
 // keys on the row's own path from the window's new keys. A committed key and the same key still on a path give the
 // same bits, so drafted rows equal serial ones. Partials (unnormalized o, running max m, sum l) keep the layout
 // attention.py's _merge reads.
+//
+// Packed int8 caches (kvpack rows: a head-row's D codes, then an fp16 scale a 32-value group) are read the same way,
+// each loaded value dequantized as attention.py's _packed does, ``(code + 0.5) * s / 128`` in fp32 rounded to bf16,
+// then to fp16 like a bf16 cache's value; the window's own rows arrive packed too, so a key on a path and the same key
+// committed still give the same bits.
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 namespace {
 
@@ -39,6 +45,39 @@ __device__ __forceinline__ unsigned h2(unsigned bf2) {         // two bf16 -> tw
 
 __device__ __forceinline__ uint4 h8(uint4 u) { return make_uint4(h2(u.x), h2(u.y), h2(u.z), h2(u.w)); }
 
+__device__ __forceinline__ unsigned short dq(unsigned word, int byte, float s) {   // one packed code -> fp16 bits
+    const float x = ((float)(signed char)((word >> (8 * byte)) & 0xFFu) + 0.5f) * s * 0.0078125f;
+    return __half_as_ushort(__float2half_rn(__bfloat162float(__float2bfloat16_rn(x))));
+}
+
+__device__ __forceinline__ unsigned dq2(unsigned word, int pair, float s) {
+    return (unsigned)dq(word, 2 * pair, s) | ((unsigned)dq(word, 2 * pair + 1, s) << 16);
+}
+
+// Packed pieces carry 8 codes (x, y) and their group's fp16 scale bits (z): fp16 values in the model's rotated basis.
+__device__ __forceinline__ uint4 q8(uint4 u) {
+    const float s = __half2float(__ushort_as_half((unsigned short)(u.z & 0xFFFFu)));
+    return make_uint4(dq2(u.x, 0, s), dq2(u.x, 1, s), dq2(u.y, 0, s), dq2(u.y, 1, s));
+}
+
+// A piece of 8 values at column d of a head-row: bf16 values (QB false), or codes and their group's scale.
+template <int D, bool QB>
+__device__ __forceinline__ uint4 piece(const unsigned char* row, int d) {
+    if constexpr (QB) {
+        const uint2 c = *reinterpret_cast<const uint2*>(row + d);
+        const unsigned short sc = *reinterpret_cast<const unsigned short*>(row + D + (d >> 5) * 2);
+        return make_uint4(c.x, c.y, sc, 0);
+    } else {
+        return *reinterpret_cast<const uint4*>(row + 2 * d);
+    }
+}
+
+template <bool QB>
+__device__ __forceinline__ uint4 to_half(uint4 u) { if constexpr (QB) return q8(u); else return h8(u); }
+
+template <int D, bool QB>
+struct Row { static constexpr int BYTES = QB ? D + D / 16 : 2 * D; };   // bytes a cached (or window) head-row
+
 template <int D>
 struct Smem {
     static constexpr int QS = D + QPAD, KS = D + KPAD, VS = KT + VPAD, PS = KT + PPAD;
@@ -48,7 +87,7 @@ struct Smem {
 // One 32-key sub-tile in two halves, so the next one is in flight while this one computes: ``fetch`` into registers
 // (NP 16-byte pieces of keys and of values a thread), ``put`` into smem (keys row-major fp16, values transposed,
 // validity per key). ``src(i, kp, vp)`` gives key i's cache or path rows, or false for a key the row never sees.
-template <int D>
+template <int D, bool QB>
 struct KVTile {
     static constexpr int PIECES = KT * D / 8, NP = (PIECES + LOADERS - 1) / LOADERS;   // 8 bf16 values a piece
     uint4 k[NP], v[NP];
@@ -68,8 +107,8 @@ struct KVTile {
             const unsigned char* kq;
             const unsigned char* vq;
             ok[j] = src(k0 + t, kp, vp);
-            if (ok[j]) k[j] = *reinterpret_cast<const uint4*>(kp + 2 * d);
-            if (src(k0 + tv, kq, vq)) v[j] = *reinterpret_cast<const uint4*>(vq + 2 * dv);
+            if (ok[j]) k[j] = piece<D, QB>(kp, d);
+            if (src(k0 + tv, kq, vq)) v[j] = piece<D, QB>(vq, dv);
         }
     }
     __device__ __forceinline__ void put(__half* Ks, __half* Vt, int* okk) const {
@@ -80,10 +119,10 @@ struct KVTile {
             if (threadIdx.x >= LOADERS || e >= PIECES) continue;
             const int t = e / (D / 8), d = (e % (D / 8)) * 8;
             const int tv = e % KT, dv = (e / KT) * 8;
-            const uint4 kh = ok[j] ? h8(k[j]) : make_uint4(0, 0, 0, 0);
+            const uint4 kh = ok[j] ? to_half<QB>(k[j]) : make_uint4(0, 0, 0, 0);
             *reinterpret_cast<uint2*>(Ks + t * S::KS + d) = make_uint2(kh.x, kh.y);       // KS keeps 8-byte rows
             *reinterpret_cast<uint2*>(Ks + t * S::KS + d + 4) = make_uint2(kh.z, kh.w);
-            const uint4 vh = h8(v[j]);                                              // an unseen key: zeros either way
+            const uint4 vh = to_half<QB>(v[j]);                                     // an unseen key: zeros either way
             const unsigned vw[4] = {vh.x, vh.y, vh.z, vh.w};
 #pragma unroll
             for (int q = 0; q < 4; ++q) {
@@ -205,13 +244,13 @@ struct Warp {
 };
 
 // Chunks wholly below a stream's committed keys: grid (chunk, key head, stream * tiles), ``warps`` query groups.
-template <int D>
+template <int D, bool QB>
 __global__ void __launch_bounds__(MAXW * 32) shared_kernel(
         const unsigned short* __restrict__ Q, const unsigned char* __restrict__ base, const long* __restrict__ OFF,
         const int* __restrict__ STREAM, float* __restrict__ PO, float* __restrict__ PM, float* __restrict__ PL,
         int W, int H, int HK, int G, int tiles, int warps, float scale) {
     using S = Smem<D>;
-    constexpr int RB = 2 * D;                                // bytes a cached head-row
+    constexpr int RB = Row<D, QB>::BYTES;                    // bytes a cached head-row
     extern __shared__ __align__(16) unsigned char smem[];
     const int warp = threadIdx.x >> 5;
     const int chunk = blockIdx.x, hk = blockIdx.y, s = blockIdx.z / tiles, tile = blockIdx.z % tiles;
@@ -241,7 +280,7 @@ __global__ void __launch_bounds__(MAXW * 32) shared_kernel(
         vp = base + voff + ((long)i * HK + hk) * RB;
         return true;
     };
-    KVTile<D> tl;
+    KVTile<D, QB> tl;
     tl.fetch(chunk * CH, src);
     for (int k0 = chunk * CH; k0 < chunk * CH + CH; k0 += KT) {
         __syncthreads();
@@ -260,7 +299,7 @@ __global__ void __launch_bounds__(MAXW * 32) shared_kernel(
 }
 
 // The rest of each row's chunks (from the one holding its stream's committed count): grid (row, key head, tail).
-template <int D>
+template <int D, bool QB>
 __global__ void __launch_bounds__(TW * 32) tail_kernel(
         const unsigned short* __restrict__ Q, const unsigned char* __restrict__ KN, const unsigned char* __restrict__ VN,
         const unsigned char* __restrict__ base, const long* __restrict__ OFF, const int* __restrict__ STREAM,
@@ -268,7 +307,7 @@ __global__ void __launch_bounds__(TW * 32) tail_kernel(
         float* __restrict__ PO, float* __restrict__ PM, float* __restrict__ PL, int W, int H, int HK, int G, int maxd,
         float scale) {
     using S = Smem<D>;
-    constexpr int RB = 2 * D;                                // bytes a cached (or window) head-row
+    constexpr int RB = Row<D, QB>::BYTES;                    // bytes a cached (or window) head-row
     extern __shared__ __align__(16) unsigned char smem[];
     const int node = blockIdx.x, hk = blockIdx.y;
     const int s = ROWS[node];
@@ -305,7 +344,7 @@ __global__ void __launch_bounds__(TW * 32) tail_kernel(
         }
         return false;
     };
-    KVTile<D> tl;
+    KVTile<D, QB> tl;
     tl.fetch(chunk * CH, src);
     for (int k0 = chunk * CH; k0 < kend; k0 += KT) {
         __syncthreads();
@@ -324,7 +363,8 @@ __global__ void __launch_bounds__(TW * 32) tail_kernel(
 
 }  // namespace
 
-// ``q`` (W, H, D) bf16; ``kn``, ``vn`` the window's own keys and values (W, HK, D) bf16; ``offs`` (S, 2) each stream's
+// ``q`` (W, H, D) bf16; ``kn``, ``vn`` the window's own keys and values (W, HK, D) bf16, or packed int8 rows
+// (W, HK, D + D / 16) when the caches hold them too; ``offs`` (S, 2) each stream's
 // key and value cache as bf16 element offsets from ``base`` (attention.offsets); ``streams``, ``rows``, ``paths``,
 // ``depths`` the plan; ``po``, ``pm``, ``pl`` the partials.
 void chunks(torch::Tensor q, torch::Tensor kn, torch::Tensor vn, torch::Tensor base, torch::Tensor offs,
@@ -333,7 +373,10 @@ void chunks(torch::Tensor q, torch::Tensor kn, torch::Tensor vn, torch::Tensor b
     const int W = q.size(0), H = q.size(1), D = q.size(2), HK = kn.size(1), G = H / HK, NS = streams.size(0);
     TORCH_CHECK(G <= 8 && (D == 128 || D == 256), "attention_volta: up to 8 query heads a key head, head dim 128 or 256");
     TORCH_CHECK(offs.scalar_type() == at::kLong && paths.scalar_type() == at::kInt, "attention_volta: index types");
-    TORCH_CHECK(kn.scalar_type() == at::kBFloat16 && kn.size(2) == D, "attention_volta: bf16 keys of the head dim");
+    const bool packed = kn.scalar_type() == at::kChar;
+    TORCH_CHECK((kn.scalar_type() == at::kBFloat16 && kn.size(2) == D) || (packed && kn.size(2) == D + D / 16),
+                "attention_volta: bf16 keys of the head dim, or packed int8 rows");
+    TORCH_CHECK(vn.scalar_type() == kn.scalar_type() && vn.sizes() == kn.sizes(), "attention_volta: values as keys");
     TORCH_CHECK(paths.size(1) <= MAX_NODES, "attention_volta: a path of at most ", MAX_NODES, " rows");
     if (W == 0 || n_chunks == 0) return;
     const auto stream = at::cuda::getCurrentCUDAStream();
@@ -342,30 +385,34 @@ void chunks(torch::Tensor q, torch::Tensor kn, torch::Tensor vn, torch::Tensor b
     const int pairs = W * G;                                   // a stream has at most all of them
     const int warps = std::min(MAXW, (pairs + 7) / 8);
     const int tiles = (pairs + warps * 8 - 1) / (warps * 8);
-#define LAUNCH(DV)                                                                                               \
+#define LAUNCH(DV, QV)                                                                                             \
     {                                                                                                            \
         static bool armed = false;                             /* the opt-in past 48 KB, once an instantiation */ \
         if (!armed) {                                                                                            \
-            C10_CUDA_CHECK(cudaFuncSetAttribute(shared_kernel<DV>, cudaFuncAttributeMaxDynamicSharedMemorySize, \
+            C10_CUDA_CHECK(cudaFuncSetAttribute(shared_kernel<DV, QV>, cudaFuncAttributeMaxDynamicSharedMemorySize, \
                                                 (int)Smem<DV>::bytes(MAXW)));                                    \
-            C10_CUDA_CHECK(cudaFuncSetAttribute(tail_kernel<DV>, cudaFuncAttributeMaxDynamicSharedMemorySize,  \
+            C10_CUDA_CHECK(cudaFuncSetAttribute(tail_kernel<DV, QV>, cudaFuncAttributeMaxDynamicSharedMemorySize,  \
                                                 (int)Smem<DV>::bytes(1)));                                       \
             armed = true;                                                                                        \
         }                                                                                                        \
         if (n_chunks > 1) {                                                                                      \
-            shared_kernel<DV><<<dim3(n_chunks, HK, NS * tiles), std::max(LOADERS, warps * 32),               \
+            shared_kernel<DV, QV><<<dim3(n_chunks, HK, NS * tiles), std::max(LOADERS, warps * 32),               \
                                     Smem<DV>::bytes(warps), stream>>>(                                           \
                 u(q), b8(base), offs.data_ptr<long>(), streams.data_ptr<int>(), po.data_ptr<float>(),            \
                 pm.data_ptr<float>(), pl.data_ptr<float>(), W, H, HK, G, tiles, warps, (float)scale);            \
             C10_CUDA_KERNEL_LAUNCH_CHECK();                                                                      \
         }                                                                                                        \
-        tail_kernel<DV><<<dim3(W, HK, TAIL_CHUNKS), TW * 32, Smem<DV>::bytes(1), stream>>>(                   \
+        tail_kernel<DV, QV><<<dim3(W, HK, TAIL_CHUNKS), TW * 32, Smem<DV>::bytes(1), stream>>>(                   \
             u(q), b8(kn), b8(vn), b8(base), offs.data_ptr<long>(), streams.data_ptr<int>(), rows.data_ptr<int>(),\
             paths.data_ptr<int>(), depths.data_ptr<int>(), po.data_ptr<float>(), pm.data_ptr<float>(),           \
             pl.data_ptr<float>(), W, H, HK, G, (int)paths.size(1), (float)scale);                                \
         C10_CUDA_KERNEL_LAUNCH_CHECK();                                                                          \
     }
-    if (D == 256) LAUNCH(256) else LAUNCH(128)
+    if (packed) {
+        if (D == 256) LAUNCH(256, true) else LAUNCH(128, true)
+    } else {
+        if (D == 256) LAUNCH(256, false) else LAUNCH(128, false)
+    }
 #undef LAUNCH
 }
 

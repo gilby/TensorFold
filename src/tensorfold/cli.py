@@ -251,6 +251,8 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
         raise ValueError(f"--rank {args.rank} needs --tp {args.rank + 1} or more")
     if args.tp == 4 and not getattr(family.package, "CUDA_TP4", False):
         raise ValueError(f"--tp 4: {family.title} runs on one or two GPUs on CUDA")
+    if getattr(args, "device", None) is not None:
+        os.environ["TF_CUDA_DEVICE"] = str(int(args.device))      # before any engine picks its GPU
     started = time.perf_counter()
     drafter = "" if args.no_drafts else _drafter(family, args.drafter, "cuda")
     options: dict[str, Any] = {"drafter": drafter, "tp": int(args.tp), "rank": int(args.rank), "master": args.master,

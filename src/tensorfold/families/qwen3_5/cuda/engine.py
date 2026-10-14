@@ -114,7 +114,9 @@ class Qwen27Engine:
         # an affine checkpoint's packed words at their stored precision; an EXL3 pack's by its own format
         tensor_bytes = weight_transform(model_dir, one_gpu=tp == 1)
         if exl3:
-            geometry, tensor_bytes = admission(geometry)
+            from .prefill import LAYER_MAJOR
+
+            geometry, tensor_bytes = admission(geometry, layer_major=LAYER_MAJOR)
         elif nvfp4:
             from .nvfp4_load import admission as nvfp4_admission
 

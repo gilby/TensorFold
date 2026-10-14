@@ -77,6 +77,17 @@ def _model() -> Weights:
     return Weights(config, embed, [layer], norm, _fp4(256, 128, gen), torch.ones(16, device="cuda"), quant="nvfp4")
 
 
+def test_kv_cache_scales_are_not_read():
+    """A compressed-tensors export's FP8 KV-cache scales load as nothing (the cache stays 16-bit); weights still load."""
+
+    from tensorfold.families.qwen3_5.cuda.nvfp4_load import skipped, weight_bytes
+
+    for name in ("model.language_model.layers.3.self_attn.k_scale", "model.language_model.layers.3.self_attn.v_scale"):
+        assert skipped(name) and weight_bytes(name, {"shape": [1], "dtype": "BF16"}) == (0, 0)
+    for name in ("model.language_model.layers.3.self_attn.k_proj.weight_scale", "lm_head.weight_scale"):
+        assert not skipped(name)
+
+
 def test_window_rows_equal_serial_steps():
     """A GDN verify window on NVFP4 / FP8 / bf16 weights: each path's rows and the committed state equal serial steps."""
 

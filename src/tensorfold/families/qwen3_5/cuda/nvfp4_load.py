@@ -26,10 +26,10 @@ def quantized(model_dir: Path) -> bool:
 
 
 def skipped(name: str) -> bool:
-    """Tensors the text model never reads: the vision tower and the MTP head."""
+    """Tensors the text model never reads: the vision tower, the MTP head and FP8 KV-cache scales (the cache is 16-bit)."""
 
     return (name.startswith(("model.visual.", "visual.", "vision_tower", "mtp.")) or ".visual." in name
-            or ".mtp." in name)
+            or ".mtp." in name or name.endswith(("self_attn.k_scale", "self_attn.v_scale")))
 
 
 @dataclass
@@ -127,8 +127,11 @@ def _volta_linear(name: str, kind: str, got: dict, weight: torch.Tensor, recipro
         return VoltaLinear.from_nvfp4(weight, got["weight_scale"], 1.0 / g if reciprocal else g)
     if kind == "fp8":
         s = got["weight_scale"].float().reshape(-1)
+        if s.numel() == weight.shape[0] and s.numel() > 1:   # per-channel FP8 (unsloth's compressed-tensors export)
+            return VoltaLinear.from_fp8(weight, s)
         if s.numel() != 1:
-            raise ValueError(f"{name}: FP8 with {s.numel()} scales; the CUDA engine reads one scale a tensor")
+            raise ValueError(f"{name}: FP8 with {s.numel()} scales; the CUDA engine reads one scale a tensor or one "
+                             "an output channel")
         return VoltaLinear.from_fp8(weight, float(s[0]))
     if kind == "bf16":
         return VoltaLinear.from_bf16(weight)

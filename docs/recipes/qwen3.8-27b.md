@@ -57,6 +57,7 @@ activations by default; what that costs against the FP8 prompt path (`--prefill-
 | `nvidia/Qwen3.8-27B-NVFP4` | NVFP4 MLP and head, FP8 attention and DeltaNet | one or two | not measured yet |
 | `turboderp/Qwen3.8-27B-exl3` (3.00bpw) | EXL3 | one | unchanged: EXL3 prompts never took FP8 activations |
 | `TensorFold/Qwen3.8-27B-MLX-4bit` | MLX affine 4-bit, groups of 64 | one or two | 0.73-0.82x from 2k to 128k |
+| oQe mixed widths (oMLX `oq`, every tensor 4/5/6/8-bit in groups of 64) | MLX affine, per-layer widths | one | bf16 prompts only: FP8 prompts read 4-bit groups of 64 |
 
 Mia-AiLab publishes EXL3 packs of the model (`Mia-AiLab/Qwen3.8-27B-EXL3`, `Mia-AiLab/Qwen3.8-27B-EXL3-2.0bpw`,
 `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw`) and an EXL3 DFlash2 drafter (`Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw`); none

@@ -1,4 +1,4 @@
-// Shared by the 4-bit matmuls: cp.async staging, ldmatrix, the bf16 mma, nibble decoding from B-fragment order.
+// Shared by the 4, 5, 6 and 8-bit lane matmuls: cp.async staging, ldmatrix, the bf16 mma, B-fragment decoding.
 #pragma once
 
 #include <cuda_bf16.h>
@@ -7,8 +7,37 @@
 
 namespace qmm_frag {
 
+// A 64-column tile's group block: the 4-bit nibble plane as before, then above 4 bits each value's top E bits.
+template <int GS, int BITS>
+struct Planes {
+    static_assert(BITS == 4 || BITS == 5 || BITS == 6 || BITS == 8, "lane formats: 4, 5, 6 or 8 bits");
+    static constexpr int E = BITS == 8 ? 4 : BITS - 4;   // top bits a value keeps in the high plane
+    static constexpr int V = GS / 32;                     // 32-input pieces a group
+    static constexpr int LO = 8 * GS;                     // nibble-plane words of a tile's group block
+    static constexpr int HI = 2 * GS * E;                 // high-plane words
+    static constexpr int WORDS = LO + HI;
+    static constexpr int BYTES = WORDS * 4;               // 64 * GS * BITS / 8
+    static constexpr int C = E ? 4 / E : 1;               // (n8 tile, 32-input piece) combos a high word holds
+    static constexpr uint32_t MASK = E == 1 ? 0x00010001u : E == 2 ? 0x00030003u : 0x000F000Fu;
+};
+
+// A lane's nibble word for n8 tile jg and piece v, and its high word shifted to that combo's bits.
+template <int GS, int BITS>
+__device__ __forceinline__ void lane_words(const uint32_t* pw, int jg, int lane, int v, uint32_t& lo, uint32_t& hi) {
+    using P = Planes<GS, BITS>;
+    const uint32_t* t = pw + (jg >> 3) * P::WORDS;
+    const int j = jg & 7;
+    lo = t[(j * 32 + lane) * P::V + v];
+    if constexpr (P::E > 0) {
+        const int c = j * P::V + v;
+        hi = t[P::LO + (c / P::C) * 32 + lane] >> ((c % P::C) * 4 * P::E);
+    } else {
+        hi = 0;
+    }
+}
+
 // Lane matmul tile shapes: BM rows by BN columns a block, WM x WN warps, each warp (BM / WM) x (BN / WN).
-template <int GS, int BM, int BN, int WM, int WN, int STAGES>
+template <int GS, int BM, int BN, int WM, int WN, int STAGES, int BITS = 4>
 struct LaneTile {
     static constexpr int THREADS = WM * WN * 32;
     static constexpr int MT = BM / WM / 16;               // m16 tiles a warp
@@ -16,7 +45,7 @@ struct LaneTile {
     static constexpr int ROW = GS * 2;                    // bytes of one input row a group
     static constexpr int CHUNKS = ROW / 16;
     static constexpr int X = BM * ROW;                    // stage bytes: inputs,
-    static constexpr int W = BN * GS / 2;                 // weights,
+    static constexpr int W = BN / 64 * Planes<GS, BITS>::BYTES;   // weights,
     static constexpr int S = BN * 2;                      // scales, biases (bf16),
     static constexpr int XS = BM * 4;                     // and input sums (fp32)
     static constexpr int STAGE = X + W + 2 * S + XS;
@@ -88,6 +117,34 @@ __device__ __forceinline__ uint32_t pair(uint32_t w, int s) {
     asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(t), "r"(0x3F803F80u), "r"(0xC300C300u));
 #endif
     return r;
+}
+
+// t - c on exact bf16 pairs: sub.bf16x2 from sm_90, an fma with -c before it (the same bits).
+__device__ __forceinline__ uint32_t bsub2(uint32_t t, uint32_t c) {
+    uint32_t r;
+#if __CUDA_ARCH__ >= 900
+    asm("sub.rn.bf16x2 %0, %1, %2;\n" : "=r"(r) : "r"(t), "r"(c));
+#else
+    asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(t), "r"(0x3F803F80u), "r"(c ^ 0x80008000u));
+#endif
+    return r;
+}
+
+// Values at nibble slots p and p + 4 as an exact bf16 pair (4 bits: pair()'s bits).
+template <int BITS>
+__device__ __forceinline__ uint32_t lane_pair(uint32_t lo, uint32_t hi, int p) {
+    using P = Planes<32, BITS>;
+    if constexpr (BITS == 8) {                   // 16 hi + lo from two exact nibble pairs, one exact fma
+        const uint32_t l = bsub2(((lo >> (4 * p)) & 0x000F000Fu) | 0x43004300u, 0x43004300u);
+        const uint32_t h = bsub2(((hi >> (4 * p)) & 0x000F000Fu) | 0x43004300u, 0x43004300u);
+        uint32_t r;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(h), "r"(0x41804180u), "r"(l));
+        return r;
+    } else {
+        uint32_t q = (lo >> (4 * p)) & 0x000F000Fu;
+        if constexpr (P::E > 0) q |= ((hi >> (P::E * p)) & P::MASK) << 4;
+        return bsub2(q | 0x43004300u, 0x43004300u);
+    }
 }
 
 // Programmatic dependent launch (sm_90+; no-ops before, and when the launch did not ask for it): wait for the

@@ -264,7 +264,7 @@ def embedding(ids: torch.Tensor, q) -> torch.Tensor:
         return q.weight[ids.to(torch.int64)].to(torch.bfloat16).contiguous()
     if q.layout == "host-b16":                          # sm_70 NVFP4: the bf16 table in page-locked host memory
         return q.rows(ids).to(torch.bfloat16)
-    if q.fast:
+    if q.nibble:
         return embed(ids, q.weight, q.scales, q.biases, q.k)
     from tensorfold.cuda.kernels.affine import embed as affine_embed
 

@@ -12,7 +12,7 @@ import torch
 from tensorfold.cuda import experts as grouped
 from tensorfold.cuda.moe import Routed
 from tensorfold.cuda.nvfp4 import experts as nvx
-from tensorfold.families.qwen3_5.cuda.weights import Attention, QLinear, Weights, load as load_dense
+from tensorfold.families.qwen3_5.cuda.weights import Attention, Plain, QLinear, Weights, load as load_dense
 
 MTP_FILE = "mtp-4bit.safetensors"      # the MTP layer beside a checkpoint whose conversion dropped it
 MTP_BF16_FILE = "mtp.safetensors"      # the base model's bf16 MTP layer beside an EXL3 pack (EXL3 conversions drop it)
@@ -258,24 +258,35 @@ def load_mtp(model_dir: str | Path, w: Weights, device: str = "cuda", ids=None) 
     raw = mtp_tensors(model_dir)
     if raw is None:
         return None
-    if w.quant in ("nvfp4", "exl3") or raw.get("mtp.fc.weight", torch.empty(0, dtype=torch.int32)).is_floating_point():
+    probe = raw.get("mtp.layers.0.self_attn.q_proj.weight", raw.get("mtp.fc.weight", torch.empty(0, dtype=torch.int32)))
+    if w.quant in ("nvfp4", "exl3") or probe.is_floating_point():
         return load_mtp_bf16(Path(model_dir), w, raw, ids, device)
+
+    from tensorfold.quantization import resolve_affine, validate_shapes
+
+    config = json.loads((Path(model_dir) / "config.json").read_text())
 
     def get(name: str) -> torch.Tensor:
         return raw.pop("mtp." + name).to(device)
 
     def qlinear(name: str) -> QLinear:
-        words = get(name + ".weight")
-        return QLinear(words.view(torch.int32).contiguous(), get(name + ".scales").contiguous(),
-                       get(name + ".biases").contiguous())
+        spec = resolve_affine(config, "mtp." + name)                 # the MTP layer's own entry, else the base format
+        words, scales, biases = get(name + ".weight"), get(name + ".scales"), get(name + ".biases")
+        validate_shapes(words.shape, scales.shape, biases.shape, spec)
+        return QLinear(words.view(torch.int32).contiguous(), scales.contiguous(), biases.contiguous(),
+                       gs=spec.group_size, bits=spec.bits)
 
-    fc = qlinear("fc")
     d = w.config.hidden
-    half = d // GS
-    fc_e = tile(QLinear(fc.weight[:, :d // 8].contiguous(), fc.scales[:, :half].contiguous(),
-                        fc.biases[:, :half].contiguous()))
-    fc_h = tile(QLinear(fc.weight[:, d // 8:].contiguous(), fc.scales[:, half:].contiguous(),
-                        fc.biases[:, half:].contiguous()))
+    if raw["mtp.fc.weight"].is_floating_point():                    # kept in bf16 beside quantized layers (oQ)
+        fc = get("fc.weight").to(torch.bfloat16)
+        fc_e, fc_h = Plain(fc[:, :d].contiguous()), Plain(fc[:, d:].contiguous())
+    else:
+        fc = qlinear("fc")
+        cut, half = d * fc.bits // 32, d // fc.gs
+        fc_e = tile(QLinear(fc.weight[:, :cut].contiguous(), fc.scales[:, :half].contiguous(),
+                            fc.biases[:, :half].contiguous(), gs=fc.gs, bits=fc.bits))
+        fc_h = tile(QLinear(fc.weight[:, cut:].contiguous(), fc.scales[:, half:].contiguous(),
+                            fc.biases[:, half:].contiguous(), gs=fc.gs, bits=fc.bits))
     p = "layers.0."
     attn = Attention(q=tile(qlinear(p + "self_attn.q_proj")), k=tile(qlinear(p + "self_attn.k_proj")),
                      v=tile(qlinear(p + "self_attn.v_proj")), o=tile(qlinear(p + "self_attn.o_proj")),

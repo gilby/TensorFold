@@ -21,13 +21,15 @@ def weight_transform(model_dir, *, one_gpu: bool = False):
         return json.loads((path / "config.json").read_text()), headers(path)
 
     def tiled(path: str) -> bool:
-        """4-bit words in groups of 64 with bf16 scales and biases: what loading tiles."""
+        """A lane format with bf16 scales and biases: what loading tiles."""
+
+        from .weights import LANE_FORMATS
 
         config, tensors = metadata()
         spec = resolve_affine(config, path)
         scales, biases = (tensors.get(path + suffix) for suffix in (".scales", ".biases"))
         return (spec is not None and scales is not None and biases is not None and
-                (spec.bits, spec.group_size, scales["dtype"], biases["dtype"]) == (4, 64, "BF16", "BF16"))
+                (spec.bits, spec.group_size) in LANE_FORMATS and (scales["dtype"], biases["dtype"]) == ("BF16", "BF16"))
 
     def stored(name, info):
         if info["dtype"] not in ("U32", "I32") or not name.endswith(".weight"):

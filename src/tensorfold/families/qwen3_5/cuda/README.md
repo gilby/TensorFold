@@ -14,8 +14,8 @@ produces on this machine. The bits differ from the Mac engine's; each engine is 
 | File | Kernel | What it computes | Why the bits do not depend on the row count |
 | --- | --- | --- | --- |
 | `qmm.py` | `_qmm`, `_reduce`, `_group_sums` | the lane matmul on MLX's stored layout: per 64-input group a tensor-core dot of bf16 inputs and integer-valued bf16 weights, then `acc + p * scale + xs * bias`, groups summed in order | rows run as one block of 16, 32, 64 or 128; the K split depends only on the weight's shape (`split_k`), and split slices are added in slice order |
-| `qmm_fast.py` and `tensorfold/cuda/kernels/qmm.cu` | `qmm_kernel`, `reduce_kernel` | decode matmul on weights packed once at load into tensor-core fragment order | the same group arithmetic and weight-shape K split as `qmm.py` |
-| `glue.py` | `_embed` | a 4-bit embedding row, dequantized | one program per row |
+| `qmm_fast.py` and `tensorfold/cuda/kernels/qmm.cu` | `qmm_kernel`, `reduce_kernel` | decode matmul on weights packed once at load into tensor-core fragment order: 4, 5, 6 or 8-bit affine in groups of 32 or 64 (a nibble plane plus a plane of the top bits, `qmm_frag.cuh`'s `Planes`) | the same group arithmetic and weight-shape K split as `qmm.py` at every width |
+| `glue.py` | `_embed` | a 4-bit group-64 embedding row, dequantized (other widths: `kernels/affine.py`) | one program per row |
 | | `_add_rmsnorm` | residual add, RMSNorm, and the fp32 group sums the next matmul needs | one program per row |
 | | `_gdn_pre` | GDN's depthwise convolution over each node's own path (a tree window), q/k/v split and norms, the decay `g` and `beta` | each node reads its path's inputs only |
 | | `_gated_norm`, `_swiglu`, `_attn_prep`, `_gate_mul` | gated RMSNorm with silu(z); SwiGLU; q/k norms and rotary; the attention output gate | elementwise or one row at a time |

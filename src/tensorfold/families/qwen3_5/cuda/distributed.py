@@ -253,7 +253,7 @@ def row_partial(x: torch.Tensor, q: QLinear, sk: int | None = None,
         if sk is not None:
             raise ValueError("checkpoint-format row partials use the shape's own split")
         return q.partial(x)
-    if not q.fast:
+    if not q.fast or (q.layout == "mlx" and not q.nibble):
         from tensorfold.cuda.kernels.affine import matmul as affine_matmul
 
         return affine_matmul(x, q, f32=True)

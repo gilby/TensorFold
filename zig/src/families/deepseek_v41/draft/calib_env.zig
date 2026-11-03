@@ -40,6 +40,13 @@ pub const Knobs = struct {
     pub fn fromEnv() Knobs {
         return .{ .mode = env("TF_DSV41_CALIB"), .dir = env("TF_DSV41_CALIB_DIR"), .file = env("TF_DSV41_CALIB_FILE"), .home = env("HOME") };
     }
+
+    /// `fromEnv` with `mode` when TF_DSV41_CALIB is unset or blank (a server's own default).
+    pub fn fromEnvDefault(mode_: []const u8) Knobs {
+        var k = Knobs.fromEnv();
+        if (trimmed(k.mode) == null) k.mode = mode_;
+        return k;
+    }
 };
 
 pub fn mode(raw: ?[]const u8) !Mode {

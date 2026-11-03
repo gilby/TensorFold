@@ -438,6 +438,22 @@ pub const Target = struct {
         t.stats.rewinds += 1;
     }
 
+    /// The slot's pending window dropped keeping none of its rows (a calibration's timed runs): as before it.
+    pub fn dropWindow(t: *Target, slot: u32) !void {
+        if (slot >= t.slots.len) return error.NoSlot;
+        const s = &t.slots[slot];
+        if (!s.open) return;
+        const len: usize = @intCast(s.base);
+        if (s.hist.items.len < len) return error.BadWindow;
+        s.open = false;
+        s.rows = 0;
+        s.hist.shrinkRetainingCapacity(len);
+        s.tail.end = @intCast(len);
+        s.tail.done = s.tail.end;
+        // the compressor carries restart as before any row: a run from the same base then pools its own rows exactly
+        for (s.kv.regions) |*r| kv.resetCarry(r, t.env.c);
+    }
+
     fn taps(ptr: *anyopaque, slot: u32) iface.Taps {
         const t = self(ptr);
         const s = &t.slots[slot];

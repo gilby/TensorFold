@@ -7,6 +7,7 @@ const dspark = @import("dspark.zig");
 const prompt = @import("prompt.zig");
 const target_ = @import("target.zig");
 const pass_ = @import("pass.zig");
+const calib = @import("calib.zig");
 const pipelines = @import("pipelines.zig");
 const vision_prepare = @import("vision_prepare.zig");
 
@@ -38,6 +39,8 @@ pub const Options = struct {
     drafts: bool = true,
     cache_bytes: u64 = 0,
     prompt: prompt.Opts = .{},
+    /// draft pricing: the calibration knobs (null: TF_DSV41_CALIB, `zig` when it names no mode)
+    calib: ?host.calib_env.Knobs = null,
 };
 
 /// A position's draft candidates the pass keeps (the shape the lanes size their buffers by).
@@ -88,8 +91,8 @@ pub const Metal = struct {
             .memory = .{ .ctx = m, .read = memory },
             .health = .{ .ctx = m, .read = healthy },
             .close = close,
-            // the default cost table: TF_DSV41_CALIB has nothing to time on Metal
-            .calib = .{ .mode = "default" },
+            // TF_DSV41_CALIB: a stored measurement of this shape, else (unset) one measured here and stored
+            .calib = m.opt.calib orelse host.calib_env.Knobs.fromEnvDefault("zig"),
         };
     }
 
@@ -120,8 +123,10 @@ pub const Metal = struct {
         return if (m.dp != null) m.ad.pass() else null;
     }
 
-    fn calibrate(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: host.calib_env.Knobs, _: host.calib_env.Shape) anyerror!host.calib_lanes.Boot {
-        return error.Unmeasured; // the mode is "default": never asked to measure
+    fn calibrate(ctx: *anyopaque, a: Allocator, io: std.Io, dir: []const u8, knobs: host.calib_env.Knobs, want: host.calib_env.Shape) anyerror!host.calib_lanes.Boot {
+        const m = self(ctx);
+        var c: calib.Ctx = .{ .a = a, .io = io, .t = m.t, .pass = if (m.dp != null) m.ad.pass() else null };
+        return calib.boot(&c, dir, knobs, want);
     }
 
     /// The device's allocated bytes now (the weights, slots, prompt buffers and kept-state host copies aside).

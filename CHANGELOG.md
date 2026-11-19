@@ -6,6 +6,16 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 - Metal: serve SenseNova-Loop-9B natively in BF16 and AWQ 4-bit (g128) with 56-step two-stream mHC, 512K YaRN and vision (#3859, refs #3781).
 
+- Tools: the served gates (`tools/conformance.py`, the Qwen and LFM3 serve checks and the Qwen3.8-27B HTTP gate) prove they ran what they claim: drafts landed, the sampler and the prompt cache were used, and concurrent requests overlapped (#3708, follows #2460). Thanks to @jschmied.
+
+- GLM on CUDA: a decode window's EXL3 routed experts launch on the 16-pair item plan instead of the group kernel's grid of mostly idle blocks, with the same output bytes (#2044). Thanks to @BadAd84.
+
+- Docs: the optimization ledger adds rows 30 to 32 (small-kernel fusion, stream-tile prefetch and the filled-item prompt grid), each `failed` for Flash Next on HIP with the measurements from #1603 (#3160, refs #1603). Thanks to @gilby.
+
+- Docs: the Qwen3.8-27B recipe says to serve with `--thinking-budget 4096` when thinking is on, and gives its GPQA Diamond result on TensorFold 1.2.7 and one GB10: replies cut at the limit from 78 of 198 to 0, and correct from 58.1% to 82.8% (#3373, fixes #3323).
+
+- Idol on CUDA: `tf-idol` runs Idol's denoiser on GB10 (sm_121) and on RTX 50-series and RTX PRO Blackwell (sm_120) cards against a reference case, gated step by step against idol-sdk's float32 run as on Metal, and refuses other GPUs by name (#1767, for #1757). Thanks to @jayleaton, with device runs from @GustavBlack and @Nipale-ai.
+
 - Docs: the drafter training recipe gains a section on adapting an already released drafter, budgeted from a few passes over the scarcest class at a low learning rate with early checkpoints, with the Qwen3.8-27B pilot behind it (#3369, refs #2667). Thanks to @Maxrio9.
 
 - Desktop: searching the current conversation no longer carries a project picked under All saved conversations; the request, its results, filters and navigation use the scope's own project filter, and switching back restores the project (#3900, fixes #3849). Thanks to @AIFlowML.

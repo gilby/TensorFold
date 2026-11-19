@@ -6,6 +6,32 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 - Metal: serve SenseNova-Loop-9B natively in BF16 and AWQ 4-bit (g128) with 56-step two-stream mHC, 512K YaRN and vision (#3859, refs #3781).
 
+- Core prompt cache: the radix store can keep a checkpoint inside a page as a writable tail, a store-held copy of that page's rows that is never written again; no family turns tails on yet, so every current store behaves as before (#3329, part of #2444). Thanks to @laudney.
+
+- CUDA: on a GB10, the one-launch path for two to four affine-4 prompt projections (`tf_qmm_prefill_many`) works out each thread's copy addresses once, before the K loop, instead of at every stage; the copies, their order and the math are unchanged (#2825). Thanks to @GumbiiDigital.
+
+- Inkling 2 Small: a host-only family package reads its config, checkpoint names and chat template and checks them against fixtures from the published release; nothing serves it yet (#3578, refs #3476). Thanks to @Nipale-ai.
+
+- App: Room agents keep their own reasoning effort, and an agent without one inherits the run's default (#3514). Thanks to @AIFlowML.
+
+- Tests: the Zig cache restat tests read `.lib_dir` from `zig env` instead of guessing a `lib` folder beside the executable, so they work with Homebrew Zig (#3786, fixes #3785). Thanks to @AIFlowML.
+
+- `tensorfold web`: after a PATH miss, the launcher looks in uv's tool directory for an existing Web executable before offering an install; PATH still wins and installing still needs an explicit yes (#3748, fixes #3747). Thanks to @AIFlowML.
+
+- Tests: the Metal kernel-contract gate checks the four `dsv41 xmma units` launches only where tensor units exist, so Gate 5 limits pass on Macs without them while the four simdgroup launches stay checked everywhere (#3522). Thanks to @gilby.
+
+- `tensorfold device`: a saved macOS profile is refreshed when the live GPU wired-memory limit changes, so the reported available weight bytes match the current limit (#3780, fixes #3778). Thanks to @AIFlowML.
+
+- GLM-5.3-Flash on CUDA: while rank 0's vision tower encodes a prompt's images, the other ranks sleep on their liveness lines instead of waiting in a collective receive for the whole pass, so a long image pass no longer trips a net plugin's operation timeout and stops every rank; replies are unchanged (#3675, for #3614). Thanks to @ultradaoto.
+- GLM-5.3-Flash on CUDA: while rank 0's vision tower encodes a prompt's images, the other ranks sleep on their liveness lines, as they do when no stream is left, instead of waiting in an NCCL receive for the whole pass, so a pass longer than a net plugin's operation timeout no longer stops every rank. On three GB10s at the mesh plugin's 30 s default, one 3840x2160 image (66 s), two 3072x1728 and fifteen 1920x1080 screenshots answer, with the same replies and short-image times (for #3614).
+- Desktop: a Qwen3.8-27B checkpoint is offered and loads, where the library applied the 2B geometry to every `qwen3_5` checkpoint and rejected the supported 27B at hidden size 5,120 (#3771). Thanks to @AIFlowML.
+
+- Intel Arc (XPU): two or four Level Zero GPUs open as peers in one context, with new peer-to-peer all-reduce collectives (FP16, BF16 and FP32; one shot up to 512 KiB, reduce-scatter then gather above) that sum in fixed rank order for exact bits, and `zig build xpu-tp-bench` builds `tf-xpu-tp-bench` to check and time them; nothing serves through them yet (#3585, part of #3583). Thanks to @supernovae.
+
+- Gemma 4 on Metal: an image input whose tower cannot load is refused cleanly instead of crashing during deinit, and a host test pins that a failed tower load leaves the model with none (#3421). Thanks to @jschmied.
+
+- Changelog: #3125's entry appears once, under 1.2.10; the copy in 1.2.9's section, a release published before #3125 landed, is removed (#3916, refs #3125). Thanks to @Bizuayeu.
+
 - HIP: Qwen 3.5 prices a lone stream's copy windows (suffix matches from the prompt or the reply) from its own timed rounds, so a copy that would cost more than it lands is cut to its best prefix or left off, and keeps those prices across requests; replies are unchanged, and other families opt in through `copy_guard` (#3728, fixes #3390). Thanks to @AbrahamCete.
 
 - DeepSeek-V4.1 on Metal: with `TF_DSV41_PREFILL_PIECES=1`, `TENSORFOLD_PREFILL_ORDER=srpt`, a prompt policy, share or budget, or `--decode-share` set, a prompt runs a chunk at a time between the other streams' rounds, so a short request no longer waits behind a long prompt; with none of them set, prompts run whole as before (#2950, refs #2984). Thanks to @gilby.
@@ -436,8 +462,6 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
   is identical to the release's own `infer` in torch bf16, or departs from it only where two candidate tokens lie
   within one bf16 step of each other, the same two torch's float32 run weighs. The five-page document is served the
   same way; its departures are listed in the recipe beside float32's (#2074). Thanks to @BobClawblaw.
-- GLM-5.3-Flash on CUDA with `TF_KV_SHARE` and no `--prompt-cache-gib`: the kept states' slots, `TF_KV_SHARE` at most, now come where an asked cache goes, before the windows past the engine's own, so a room that holds one more whole window no longer keeps fewer states; Jammed XSFP4 at TP=3 on three GB10s keeps all 32 at `TF_KV_SHARE=32` instead of 8, with the same tokens (#3125). Thanks to @Bizuayeu.
-
 
 - Server: with thinking off, the reasoning effort a request names reaches the chat template (GLM's head follows it), and the reply reports it; a server's own `--reasoning-effort` no longer changes a thinking-off prompt (#3017, fixes #1911). Thanks to @ss-cong for the report.
 

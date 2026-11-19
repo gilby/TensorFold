@@ -24,11 +24,11 @@
   "prompt_cache_gib": 1,
   "ignore_eos": true,
   "prompts": {
+    "copy": "Repeat exactly: The harbor lights came on one by one as the fishing boats returned to the quay.",
     "poem": "Write a short poem about the sea.",
     "primes": "List the first twelve prime numbers, separated by commas.",
     "sky": "Explain in two sentences why the sky is blue.",
-    "count": "Count from one to thirty in words.",
-    "copy": "Repeat exactly: The harbor lights came on one by one as the fishing boats returned to the quay."
+    "count": "Count from one to thirty in words."
   },
   "long_items": 500,
   "conversation": [

@@ -104,7 +104,8 @@ pub const Metal = struct {
         const device = runner.model.device;
         const tensor_units = device.tensorUnits();
         const window = try windowRows(tensor_units);
-        const copies = try @import("qwen27_window.zig").copyPolicy(tensor_units, window, if (platform.c.getenv("TF_QWEN27_COPIES")) |v| std.mem.span(v) else null);
+        const copies_env = if (platform.c.getenv("TF_QWEN27_COPIES")) |v| std.mem.span(v) else null;
+        const copies = try @import("qwen27_window.zig").copyPolicy(tensor_units, window, copies_env orelse if (runner.model.config.looped) "1" else null);
         const ops = try tf.tree_round_gpu.Ops.init(device);
         errdefer ops.deinit();
         const picks = try device.buffer(batch_rows * @sizeOf(contract.Pick), opts);
@@ -169,7 +170,7 @@ pub const Metal = struct {
         const narrow: usize = @min(b.window, b.timed);
         // routed experts make a drafted window read most expert weights: plain rounds compete with drafted depths
         const routed = b.runner.model.config.moe();
-        return .{ .exact_width = if (drafting or shared) b.window else 1, .mtp = drafting, .speculate = drafting, .speculate_early = false, .drafts = b.nodes, .draft_probabilities = true, .plain_guard = routed, .window_costs = b.costs[0..narrow], .shared_costs = b.costs[narrow..b.timed], .hidden_rows = shared, .streams_exact = true, .batch_rows = if (shared) batch_rows else b.window, .max_streams = b.runner.slots, .lone_copies = lone_copies, .context_copies = lone_copies, .allocate_shared_drafts = drafting, .draft_streams = drafting and b.draft_slots > 1 };
+        return .{ .exact_width = if (drafting or shared or lone_copies) b.window else 1, .mtp = drafting, .speculate = drafting, .speculate_early = false, .drafts = b.nodes, .draft_probabilities = true, .plain_guard = routed, .window_costs = b.costs[0..narrow], .shared_costs = b.costs[narrow..b.timed], .hidden_rows = shared, .streams_exact = true, .batch_rows = if (shared) batch_rows else b.window, .max_streams = b.runner.slots, .lone_copies = lone_copies, .context_copies = lone_copies, .allocate_shared_drafts = drafting, .draft_streams = drafting and b.draft_slots > 1 };
     }
 
     /// The slot holding `s`.

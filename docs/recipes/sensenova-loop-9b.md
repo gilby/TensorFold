@@ -49,8 +49,8 @@ Measured against `sensenova/SenseNova-Loop-9B` (Apache-2.0, Hugging Face revisio
 ### Metal kernel contracts
 
 - **Apple M5 Ultra (`applegpu_g17`, `tensor_units=true`):**
-  - `--only sensenova --offline`: `24 kernels: 24 pass gates 1-4, 0 fail, 0 known findings; 45 controls: 45 red as planted, 0 missed; 0 limit problems`.
+  - `--only sensenova`: `24 kernels: 24 pass gates 1-4, 0 fail, 0 known findings; 45 controls: 45 red as planted, 0 missed; 0 limit problems`.
   - `--only qwen27`: `40 kernels: 40 pass gates 1-4, 0 fail, 0 known findings; 6 controls: 6 red as planted, 0 missed; 0 limit problems`.
 - **Apple M3 Ultra (`applegpu_g15`, `tensor_units=false`, macOS `26.6.2`):**
-  - `--only sensenova --offline`: `17 kernels: 17 pass gates 1-4, 0 fail, 0 known findings; 37 controls: 37 red as planted, 0 missed; 0 limit problems`.
+  - `--only sensenova`: `17 kernels: 17 pass gates 1-4, 0 fail, 0 known findings; 37 controls: 37 red as planted, 0 missed; 0 limit problems`.
   - `--only qwen27`: `30 kernels: 30 pass gates 1-4, 0 fail, 0 known findings; 3 controls: 3 red as planted, 0 missed; 0 limit problems`.

@@ -106,7 +106,11 @@ pub const Model = struct {
             gen_text = std.Io.Dir.cwd().readFileAlloc(io, gen_path, a, .limited(1 << 20)) catch null;
         }
         defer if (gen_text) |gt| a.free(gt);
-        const c = try cfg.parseWithOptions(a, text, gen_text, opts);
+        var problem: cfg.Problem = .{};
+        const c = cfg.parseWithOptionsWhy(a, text, gen_text, opts, &problem) catch |e| {
+            if (problem.len != 0) std.log.err("{s}: {s}", .{ path, problem.text() });
+            return e;
+        };
         var local = c;
         const shard = if (ranks == 1) cfg.Shard{ .rank = 0, .ranks = 1, .global = c, .local = local } else try cfg.split(&local, rank, ranks, mode);
         try supported(shard.global);

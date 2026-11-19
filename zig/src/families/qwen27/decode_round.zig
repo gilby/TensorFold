@@ -264,7 +264,7 @@ pub const Runner = struct {
         try r.settleKeep();
         if (r.failed or r.active != null or round.ids.len > r.model.frame.capacity) return error.RoundNotReady;
         mtl.pass_metrics.rows(round.ids.len);
-        if (r.tail != null and head == .none) return error.BadVerifyTail;
+        if (r.tail != null and (if (r.model.config.looped) head == .none else (accepted or head != .all))) return error.BadVerifyTail;
         // A rank's head writes only this rank's vocabulary columns; the tail's matcher reads the whole vocabulary.
         if (r.tail != null and r.reduce != null) return error.TailOnRank;
         for (round.slots, round.windows) |slot, window| if (slot >= r.ready or r.offsets[slot] != window.start) return error.CachePositionDiffers;
@@ -513,9 +513,12 @@ pub const Runner = struct {
         var views: [attn.planning.max_streams]attn.Cache = undefined;
         const caches = r.layerCaches(layer, r.current_round orelse return error.RoundNotReady, &views);
         try r.bindings[layer].upload(plan, caches);
-        if (comptime @hasDecl(@import("core"), "sensenova_loop")) {
+        const attn_loop = if (comptime @hasDecl(@import("core"), "sensenova_loop")) blk: {
+            if (!r.model.config.looped) break :blk false;
             try @import("loop.zig").encodeAttnProj(&r.model.kernels, r.model.glue, e, weights, f, rows, @intCast(r.model.config.qDim()), @intCast(r.model.config.kvDim()));
-        } else {
+            break :blk true;
+        } else false;
+        if (!attn_loop) {
             try r.model.kernels.quant(e, weights.q, f.get(.input), forward.sums(f, .sums, rows), f.get(.dims), f.get(.q_gate), rows);
             try r.model.kernels.quant(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.dims), f.get(.mixed), rows);
             e.barrier();

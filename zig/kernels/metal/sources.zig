@@ -190,9 +190,8 @@ pub const core_deltanet = @embedFile("core/deltanet.metal") ++ "\n" ++ @embedFil
 pub const core_sensenova_mhc = @embedFile("core/sensenova_mhc.metal");
 /// SenseNova-Loop BF16 row matvec and nax.h prefill GEMM kernels.
 pub const qwen27_bf16_linear = @embedFile("qwen27/bf16_linear.metal");
-/// SenseNova-Loop AWQ W4A16 g128 lossless FP32-metadata M5, M3, and GPU quantizer kernels.
-pub const qwen27_awq_w4a16 = @embedFile("qwen27/awq_w4a16.metal") ++ "\n" ++ @embedFile("qwen27/awq_m5_fast.metal") ++
-    "\n" ++ @embedFile("qwen27/awq_quant.metal");
+/// SenseNova-Loop AWQ W4A16 g128 lossless FP32-metadata M5 and M3 kernels.
+pub const qwen27_awq_w4a16 = @embedFile("qwen27/awq_w4a16.metal") ++ "\n" ++ @embedFile("qwen27/awq_m5_fast.metal");
 /// 4-bit projections on simdgroup-matrix tiles before the M5 (core/simd_qmm.zig).
 pub const core_simd_qmm = @embedFile("core/simd_qmm.metal");
 /// 2- to 8-bit projections on the same tiles, rows written at a stride (core/simd_qmm_bits.zig).

@@ -1,6 +1,6 @@
 # SenseNova-Loop-9B on native Metal
 
-SenseNova-Loop-9B (`sensenova/SenseNova-Loop-9B`, `sensenova_loop` / `sensenova_loop_text`) runs natively on Apple Silicon in both full BF16 and AWQ 4-bit (`group_size=128`) weights through the Metal `qwen27` lane backend.
+SenseNova-Loop-9B (`sensenova/SenseNova-Loop-9B`, `model_type: sensenova_loop`) runs natively on Apple Silicon in both full BF16 and AWQ 4-bit (`group_size=128`) weights through the Metal `qwen27` lane backend.
 
 ## Architecture and execution schedule
 
@@ -8,8 +8,9 @@ The checkpoint expands `32` physical decoder layers into `56` executed steps at 
 
 Each trunk layer runs a two-stream manifold-constrained hyper-connection (`mHC`) pre/post routing block (`Sinkhorn-Knopp`, `20` iterations, `pre_scale=1.0`), fused across adjacent steps via `sn_mhc_post_and_pre_norm`. Sibling linear projections (`qkv` + `zba` on linear-attention layers and `q` + `k` + `v` on non-tail attention layers) are stacked with `OutSplits`, reducing executed dense dispatches from `281` to `226` per token.
 
-- **Weights and formats:** BF16 safetensors (`26,249 MB` executed linear traffic/step) and AWQ W4A16 `g128` (`7,398 MB` executed linear traffic/step, lossless FP32 scale/zero metadata).
-- **Context length:** Static YaRN scaling enabled at `factor=2.0` (`262,144` base to `524,288` max context), plus `--rope-yarn` override.
+- **Weights and formats:** BF16 safetensors (`26,249 MB` executed linear traffic/step) and standard AutoAWQ GEMM `W4A16` `g128` (`7,398 MB` executed linear traffic/step, lossless FP32 scale/zero metadata).
+- **AWQ g128 export config:** Converted from `sensenova/SenseNova-Loop-9B` (`rev 3e1ba6e8ac98090f9f7c03a55f26269eb3850fb6`) with `"quantization_config": {"quant_method": "awq", "bits": 4, "group_size": 128, "zero_point": true, "version": "gemm"}`, keeping `mhc_*`, `linear_attn.{in_proj_a,in_proj_b,conv1d,A_log,dt_bias,norm}`, RMSNorms, `embed_tokens`, `model.visual`, and `loop_gate` in BF16 (`modules_to_not_convert`), calibrating AWQ input activation scales across both loop passes of layers `4..27`.
+- **Context length:** Static YaRN scaling enabled at `factor=2.0` (`262,144` base to `524,288` max context), plus `--rope-yarn` factor selection on SenseNova checkpoints.
 - **Vision inputs:** Supports the checkpoint's `model.visual.` tower through `--vision`.
 - **Prompt chunking and decoding:** Uses `2048`-row linear-attention prompt chunks on Apple M3 Ultra and M5 Ultra (via single-chain prompt planning on `wide_prompt`), Copy-Draft (`--no-drafts` disables drafting), and fused tail greedy argmax.
 

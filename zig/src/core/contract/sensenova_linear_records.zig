@@ -94,7 +94,7 @@ pub const awq_m5_records = blk: {
 
 pub const awq_common_records = blk: {
     @setEvalBranchQuota(20000);
-    var out: [row_tiers.len * sk_vals.len + 5]M = undefined;
+    var out: [row_tiers.len * sk_vals.len + 3]M = undefined;
     var at: usize = 0;
     for (row_tiers) |r| {
         const cols: u32 = if (r >= 2 and r <= 8) 2 else 1;
@@ -114,8 +114,6 @@ pub const awq_common_records = blk: {
         .{ "sensenova awq sn_awq_qmm_m3", 128, 2 * 64 * 36 * 4 },
         .{ "sensenova awq sn_awq_xsum_128", 256, 0 },
         .{ "sensenova awq sn_awq_scale_input", 256, 0 },
-        .{ "sensenova awq sn_awq_int4_embed", 256, 0 },
-        .{ "sensenova awq sn_awq_quantize_bf16", 256, 0 },
     };
     for (tail) |t| {
         out[at] = .{ .name = t[0], .threads = t[1], .tg_memory = t[2], .reserved = t[1], .offline = false };

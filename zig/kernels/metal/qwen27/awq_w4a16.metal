@@ -559,26 +559,3 @@ inline void sn_qmm_m3_store(threadgroup float* Bs_buf, int n_row, int N, int r_l
   const size_t idx = (size_t)gid.y * dims.y + gid.x;
   Y[idx] = bfloat(float(X[idx]) / scale[gid.x]);
 }
-
-// Optional row-major int4 embedding lookup: W [vocab, K/8] sequential nibbles, SB [vocab, K/128] float2.
-[[max_total_threads_per_threadgroup(256)]]
-[[kernel]] void sn_awq_int4_embed(
-    const device uint* ids [[buffer(0)]],
-    const device uint* W [[buffer(1)]],
-    const device float2* SB [[buffer(2)]],
-    constant int4& dims [[buffer(3)]],
-    device bfloat* Y [[buffer(4)]],
-    uint2 gid [[thread_position_in_grid]]) {
-  const int rows = dims.x, K = dims.y, vocab = dims.z;
-  if (int(gid.x) >= K || int(gid.y) >= rows) return;
-  const uint id = ids[gid.y];
-  if (int(id) >= vocab) {
-    Y[(size_t)gid.y * K + gid.x] = bfloat(0.0f);
-    return;
-  }
-  const int k = int(gid.x);
-  const uint word = W[(size_t)id * (K / 8) + (k >> 3)];
-  const uint q = (word >> (4 * (k & 7))) & 0xfu;
-  const float2 sb = SB[(size_t)id * (K / 128) + (k >> 7)];
-  Y[(size_t)gid.y * K + k] = bfloat(fma(float(q), sb.x, sb.y));
-}

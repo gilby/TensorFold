@@ -99,9 +99,12 @@ pub const Model = struct {
         defer a.free(path);
         const text = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20));
         defer a.free(text);
-        const gen_path = try std.fs.path.join(a, &.{ dir, "generation_config.json" });
-        defer a.free(gen_path);
-        const gen_text = std.Io.Dir.cwd().readFileAlloc(io, gen_path, a, .limited(1 << 20)) catch null;
+        var gen_text: ?[]const u8 = null;
+        if (cfg.isSenseNovaRoot(a, text)) {
+            const gen_path = try std.fs.path.join(a, &.{ dir, "generation_config.json" });
+            defer a.free(gen_path);
+            gen_text = std.Io.Dir.cwd().readFileAlloc(io, gen_path, a, .limited(1 << 20)) catch null;
+        }
         defer if (gen_text) |gt| a.free(gt);
         const c = try cfg.parseWithOptions(a, text, gen_text, opts);
         var local = c;

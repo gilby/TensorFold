@@ -59,8 +59,6 @@ pub const Kind = enum {
     awq_m3_qmm,
     awq_xsum,
     awq_scale_input,
-    awq_embed,
-    awq_quant,
 };
 
 pub const Key = struct {
@@ -241,8 +239,6 @@ pub const LinearGpu = struct {
             .awq_m3_qmm => "sn_awq_qmm_m3",
             .awq_xsum => "sn_awq_xsum_128",
             .awq_scale_input => "sn_awq_scale_input",
-            .awq_embed => "sn_awq_int4_embed",
-            .awq_quant => "sn_awq_quantize_bf16",
         };
         const lib = switch (key.kind) {
             .bf16_mv, .bf16_gemm, .bf16_splitk, .bf16_splitk_sum => try g.bf16Lib(),
@@ -521,10 +517,6 @@ pub const LinearGpu = struct {
         e.setValue(makeAwqArgs(rows, mat.n, mat.k, 0, ldy, splits, addrs, 0), 3);
         e.setBuffer(y.buf, y.off, 4);
         e.dispatchGroups(mtl.Size.of((mat.n + 63) / 64, (rows + 63) / 64, 1), mtl.Size.of(128, 1, 1));
-    }
-
-    pub fn quantizeBf16ToAwq(g: *LinearGpu, queue: mtl.Queue, src: Bf16Matrix) !AwqMatrix {
-        return quant.quantizeBf16ToAwq(g, queue, src);
     }
 
     /// Sweeps SK in {1,2,4,8} for decode and prefill across SenseNova shapes.

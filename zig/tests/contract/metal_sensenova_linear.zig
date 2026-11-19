@@ -445,7 +445,7 @@ pub const Suite = struct {
         var prng = std.Random.DefaultPrng.init(0x3333);
         for (w_buf.slice(u16, @as(usize, n) * k)) |*d| d.* = c.toBf16((prng.random().float(f32) * 2.0 - 1.0) * 0.25);
         for (x_buf.slice(u16, @as(usize, 33) * k)) |*d| d.* = c.toBf16((prng.random().float(f32) * 2.0 - 1.0) * 1.5);
-        var mat = try gpu.quantizeBf16ToAwq(s.queue, try lgpu.LinearGpu.prepareBf16(w_buf, 0, n, k));
+        var mat = try bf16_k.packBf16AsAwq(&gpu, w_buf.slice(u16, @as(usize, n) * k), n, k);
         defer mat.deinit();
         for ([_]u32{ 33, 1, 4, 8, 16 }) |rows| {
             const dst = if (rows == 33) y_ref else y_cur;

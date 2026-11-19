@@ -101,8 +101,8 @@ test "q27_rope: t = h = w is plain rope bit for bit, and an image row's pairs tu
         const sn = @sin(angle) * y_tbl.scale;
         const ref_f = if (second) v * cs + pval * sn else v * cs - pval * sn;
         const ref_b: u16 = @truncate((@as(u32, @bitCast(ref_f)) + 0x7fff + ((@as(u32, @bitCast(ref_f)) >> 16) & 1)) >> 16);
-        const gpu_f: f32 = @bitCast(@as(u32, y_gpu[idx]) << 16);
-        const ref_bf: f32 = @bitCast(@as(u32, ref_b) << 16);
-        try std.testing.expectApproxEqAbs(ref_bf, gpu_f, @max(1e-3, @abs(ref_bf) * 0.02));
+        const ulp_ok = ((ref_b & 0x7fff) == 0 and (y_gpu[idx] & 0x7fff) == 0) or
+            ((ref_b ^ y_gpu[idx]) < 0x8000 and @abs(@as(i32, ref_b) - @as(i32, y_gpu[idx])) <= 1);
+        try std.testing.expect(ulp_ok);
     };
 }

@@ -473,7 +473,13 @@ pub const Attention = struct {
         if (chunks > scratch.chunks or plan.tiles > scratch.tiles) return error.AttentionLimits;
         // before M5 (no shared prefix) the partials take the tail's buffers, which hold every chunk's packed rows
         const parts = if (g.shared_prefix) [3]Field{ .poa, .pma, .pla } else [3]Field{ .pob, .pmb, .plb };
-        if (!g.shared_prefix and @as(usize, g.kv_heads) * chunks * plan.tiles * 16 * g.dim * 4 > scratch.get(.pob).buffer.length()) return error.AttentionLimits;
+        if (!g.shared_prefix) {
+            const fits = if (g.wide_prompt)
+                @as(usize, g.kv_heads) * chunks * plan.tiles * 16 * g.dim * 4 <= scratch.get(.pob).buffer.length()
+            else
+                @as(usize, chunks) * plan.tiles * 16 <= @as(usize, scratch.tail_chunks) * scratch.limits.rows * 16;
+            if (!fits) return error.AttentionLimits;
+        }
         const args = PromptArgs{ .start = start, .rows = @intCast(plan.rows), .chunks = @intCast(chunks), .rp = @intCast(plan.tiles * 16), .key_stride = @intCast(binding.strides[0][0]), .value_stride = @intCast(binding.strides[0][1]), .scale2 = 0.0625 * std.math.log2e, .kv_heads = @intCast(g.kv_heads) };
         const pairs = prompt_threads / 64; // simdgroup pairs, each halving the head dim of one 16-row tile
         const pick = scratch.get(.pick).buffer;

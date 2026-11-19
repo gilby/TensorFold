@@ -308,6 +308,28 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8, generation: ?[]const u8) 
     return parseWithOptions(gpa, json, generation, .{});
 }
 
+/// Whether `json`'s root object declares `model_type == "sensenova_loop"`.
+pub fn isSenseNovaRoot(gpa: std.mem.Allocator, json: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, json, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const mt = parsed.value.object.get("model_type") orelse return false;
+    return mt == .string and std.mem.eql(u8, mt.string, "sensenova_loop");
+}
+
+/// Resolved context ceiling for a `sensenova_loop` checkpoint directory under optional `--rope-yarn`.
+pub fn senseNovaMaxContext(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, rope_yarn: ?f64) !usize {
+    const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
+    defer gpa.free(path);
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(16 << 20));
+    defer gpa.free(text);
+    const gen_path = try std.fs.path.join(gpa, &.{ dir, "generation_config.json" });
+    defer gpa.free(gen_path);
+    const gen_text = std.Io.Dir.cwd().readFileAlloc(io, gen_path, gpa, .limited(1 << 20)) catch null;
+    defer if (gen_text) |gt| gpa.free(gt);
+    return (try parseWithOptions(gpa, text, gen_text, .{ .rope_yarn = rope_yarn })).max_position;
+}
+
 pub fn parseWithOptions(gpa: std.mem.Allocator, json: []const u8, generation: ?[]const u8, opts: ParseOptions) !Config {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
     defer parsed.deinit();
@@ -333,8 +355,8 @@ pub fn parseWithOptions(gpa: std.mem.Allocator, json: []const u8, generation: ?[
         break :blk try integer(v, false);
     } else hidden / heads;
     const rope = rope_config.params(t) catch return error.BadConfig;
-    // qwen3_5 without --rope-yarn still refuses YaRN/rope_scaling as config_test requires
-    if (!looped and opts.rope_yarn == null and (rope_config.typed(rope) != null or rope_config.legacy(if (t.contains("rope_scaling")) t else root))) return error.UnsupportedRopeScaling;
+    // theta alone: non-SenseNova checkpoints refuse YaRN/rope_scaling and --rope-yarn as before
+    if (!looped and (opts.rope_yarn != null or rope_config.typed(rope) != null or rope_config.legacy(if (t.contains("rope_scaling")) t else root))) return error.UnsupportedRopeScaling;
     const factor = if (rope) |r| try optional(r, "partial_rotary_factor", try optional(t, "partial_rotary_factor", 0.25)) else try optional(t, "partial_rotary_factor", 0.25);
     if (factor <= 0 or factor > 1) return error.BadConfig;
     var c = Config{
@@ -362,8 +384,8 @@ pub fn parseWithOptions(gpa: std.mem.Allocator, json: []const u8, generation: ?[
         c.renorm = if (t.get("norm_topk_prob")) |v| (if (v == .bool) v.bool else return error.BadConfig) else true;
         if (c.experts > 256 or c.top_k >= c.experts or c.top_k > 15 or c.moe_intermediate != c.intermediate) return error.UnsupportedRouting;
     }
-    if (t.get("max_position_embeddings") orelse root.get("max_position_embeddings")) |v| c.max_position = try integer(v, false);
-    if (looped or opts.rope_yarn != null) {
+    if (if (looped) (t.get("max_position_embeddings") orelse root.get("max_position_embeddings")) else t.get("max_position_embeddings")) |v| c.max_position = try integer(v, false);
+    if (looped) {
         const res = try yarn.resolve(t, root, rope, c.rope_theta, c.max_position, opts.rope_yarn);
         c.rope = res.rope;
         c.max_position = res.ceiling;

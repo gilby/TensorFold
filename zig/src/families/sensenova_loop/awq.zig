@@ -29,7 +29,7 @@ pub const ScaleDType = enum {
 
 pub const Layout = enum { m5_tile, m3_row };
 
-/// Parsed `loop_awq_config` / `quantization_config` for AutoAWQ GEMM.
+/// Parsed `quantization_config` / `quantization` for AutoAWQ GEMM.
 pub const Config = struct {
     bits: u8 = 4,
     group_size: usize = 128,
@@ -61,11 +61,11 @@ pub const Config = struct {
 };
 
 fn findQuantObject(root: std.json.ObjectMap) ?std.json.ObjectMap {
-    for ([_][]const u8{ "loop_awq_config", "quantization_config", "quantization" }) |k| {
+    for ([_][]const u8{ "quantization_config", "quantization" }) |k| {
         if (root.get(k)) |v| if (v == .object) return v.object;
     }
     if (root.get("text_config")) |tc| if (tc == .object) {
-        for ([_][]const u8{ "loop_awq_config", "quantization_config", "quantization" }) |k| {
+        for ([_][]const u8{ "quantization_config", "quantization" }) |k| {
             if (tc.object.get(k)) |v| if (v == .object) return v.object;
         }
     };
@@ -76,7 +76,7 @@ pub fn parseConfig(a: std.mem.Allocator, root: std.json.ObjectMap) !?Config {
     const obj = findQuantObject(root) orelse return null;
     if (obj.get("quant_method")) |qm| {
         if (qm != .string) return error.UnsupportedQuantization;
-        if (!std.ascii.eqlIgnoreCase(qm.string, "awq") and !std.ascii.eqlIgnoreCase(qm.string, "loop_awq")) {
+        if (!std.ascii.eqlIgnoreCase(qm.string, "awq")) {
             return null;
         }
     } else return null;
@@ -527,10 +527,10 @@ test "test_awq: stacking matching input_scale vs per-part split when input_scale
     try std.testing.expectEqual(@as(usize, 24), split[1].n);
 }
 
-test "test_awq: loop_awq_config parsing and modules_to_not_convert matching" {
+test "test_awq: quantization_config parsing and modules_to_not_convert matching" {
     const a = std.testing.allocator;
     const text =
-        \\{"loop_awq_config": {"quant_method": "awq", "bits": 4, "group_size": 128,
+        \\{"quantization_config": {"quant_method": "awq", "bits": 4, "group_size": 128,
         \\ "zero_point": true, "version": "gemm", "modules_to_not_convert": ["lm_head", "visual"]}}
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, a, text, .{});
@@ -542,4 +542,7 @@ test "test_awq: loop_awq_config parsing and modules_to_not_convert matching" {
     try std.testing.expect(!cfg.isQuantized("lm_head"));
     try std.testing.expect(!cfg.isQuantized("model.visual.blocks.0.attn.qkv"));
     try std.testing.expect(cfg.isQuantized("model.layers.0.self_attn.q_proj"));
+    const legacy = try std.json.parseFromSlice(std.json.Value, a, "{\"loop_awq_config\":{\"quant_method\":\"loop_awq\"}}", .{});
+    defer legacy.deinit();
+    try std.testing.expect((try parseConfig(a, legacy.value.object)) == null);
 }

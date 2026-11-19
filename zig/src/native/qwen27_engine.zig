@@ -17,6 +17,20 @@ pub fn owns(a: Allocator, io: std.Io, dir: []const u8) bool {
     return true;
 }
 
+/// Validates a `sensenova_loop` context request against the checkpoint's resolved base or YaRN ceiling.
+pub fn senseNovaContextOk(a: Allocator, io: std.Io, dir: []const u8, rope_yarn: ?f64, context: i64, problem: *[]const u8) !bool {
+    const max_ctx: i64 = @intCast(tf.qwen27.config.senseNovaMaxContext(a, io, dir, rope_yarn) catch |err| {
+        problem.* = switch (err) {
+            error.UnsupportedRopeScaling, error.RopeYarnFactor, error.RopeYarnConflict => "--rope-yarn / rope_parameters: static YaRN (factor > 1) is supported on looped SenseNova checkpoints without conflicting factors",
+            else => try std.fmt.allocPrint(a, "the native SenseNova engine cannot load {s} ({s})", .{ dir, @errorName(err) }),
+        };
+        return false;
+    });
+    if (context <= max_ctx) return true;
+    problem.* = try std.fmt.allocPrint(a, "--context {d} is outside this SenseNova checkpoint's 1 to {d} tokens", .{ context, max_ctx });
+    return false;
+}
+
 test "a qwen3_5 checkpoint opens the 27B engine unless it has the 2B's geometry or a tied head" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();

@@ -342,6 +342,42 @@ fn runAwq(
     }
 }
 
+pub fn packBf16AsAwq(gpu: *const lgpu.LinearGpu, w_bf16: []const u16, n: u32, k: u32) !lgpu.AwqMatrix {
+    const awq = tf.sensenova_loop.awq;
+    const kg = k / 128;
+    const layout: awq.Layout = if (gpu.tensor_units) .m5_tile else .m3_row;
+    const w = try gpu.allocator.alloc(u32, awq.weightWords(n, k, layout));
+    defer gpu.allocator.free(w);
+    @memset(w, 0);
+    const sb = try gpu.allocator.alloc(awq.Float2, awq.metaCount(n, k));
+    defer gpu.allocator.free(sb);
+    for (0..n) |j| for (0..kg) |gi| {
+        const row = w_bf16[j * k + gi * 128 ..][0..128];
+        var min_v: f32 = 0;
+        var max_v: f32 = 0;
+        for (row) |b| {
+            const v: f32 = @floatCast(c.fromBf16(b));
+            min_v = @min(min_v, v);
+            max_v = @max(max_v, v);
+        }
+        const scale = (max_v - min_v) / 15.0;
+        const zp: f32 = if (scale != 0) @floatFromInt(@as(u32, @intFromFloat(std.math.clamp(@round(-min_v / scale), 0.0, 15.0)))) else 0;
+        const bias = if (scale != 0) -zp * scale else min_v;
+        sb[if (layout == .m5_tile) gi * n + j else j * kg + gi] = .{ .scale = scale, .bias = bias };
+        for (0..16) |w16| {
+            var word: u32 = 0;
+            for (0..8) |ni| {
+                const vf: f32 = @floatCast(c.fromBf16(row[w16 * 8 + ni]));
+                const q_val: u32 = if (scale != 0) @intFromFloat(std.math.clamp(@round((vf - bias) / scale), 0.0, 15.0)) else 0;
+                word |= q_val << @intCast(ni * 4);
+            }
+            const w_idx = if (layout == .m5_tile) (((j / 32) * kg + gi) * 32 + (j % 32)) * 16 + w16 else j * (k / 8) + gi * 16 + w16;
+            w[w_idx] = word;
+        }
+    };
+    return lgpu.LinearGpu.prepareAwqFromPacked(gpu, .{ .n = n, .k = k, .layout = layout, .w = w, .sb = sb, .input_scale = null });
+}
+
 fn verifyAwqSplitCase(gpu: *lgpu.LinearGpu, q: mtl.Queue, n: u32, k: u32, rows: u32, prompt: bool, split1: u32, split2: u32) !void {
     const opts = mtl.ResourceOptions.shared;
     const x_buf = try gpu.device.buffer(@as(usize, rows) * k * 2, opts);
@@ -355,7 +391,8 @@ fn verifyAwqSplitCase(gpu: *lgpu.LinearGpu, q: mtl.Queue, n: u32, k: u32, rows: 
     const w0 = split1;
     const w1 = (if (has2) split2 else n) - split1;
     const w2 = if (has2) n - split2 else 0;
-    var full = try gpu.quantizeBf16ToAwq(q, try lgpu.LinearGpu.prepareBf16(w_buf, 0, n, k));
+    const w_all = w_buf.slice(u16, @as(usize, n) * k);
+    var full = try packBf16AsAwq(gpu, w_all, n, k);
     defer full.deinit();
     const y_ref = try gpu.device.buffer(@as(usize, rows) * n * 2, opts);
     defer y_ref.deinit();
@@ -389,16 +426,16 @@ fn verifyAwqSplitCase(gpu: *lgpu.LinearGpu, q: mtl.Queue, n: u32, k: u32, rows: 
     }
 
     const sk_match: ?u32 = if (prompt) null else lgpu.decodeSk(gpu.tensor_units, true, n, k);
-    var m0 = try gpu.quantizeBf16ToAwq(q, try lgpu.LinearGpu.prepareBf16(w_buf, 0, w0, k));
+    var m0 = try packBf16AsAwq(gpu, w_all[0 .. @as(usize, w0) * k], w0, k);
     defer m0.deinit();
     try runAwq(gpu, q, m0, xr, null, .{ .buf = y_sep }, rows, w0, prompt, sk_match, .{});
     if (!std.mem.eql(u16, y_sep.slice(u16, @as(usize, rows) * w0), y0_s)) return error.SplitSeparateMismatch;
-    var m1 = try gpu.quantizeBf16ToAwq(q, try lgpu.LinearGpu.prepareBf16(w_buf, @as(usize, split1) * k * 2, w1, k));
+    var m1 = try packBf16AsAwq(gpu, w_all[@as(usize, split1) * k ..][0 .. @as(usize, w1) * k], w1, k);
     defer m1.deinit();
     try runAwq(gpu, q, m1, xr, null, .{ .buf = y_sep }, rows, w1, prompt, sk_match, .{});
     if (!std.mem.eql(u16, y_sep.slice(u16, @as(usize, rows) * w1), y1_s)) return error.SplitSeparateMismatch;
     if (has2) {
-        var m2 = try gpu.quantizeBf16ToAwq(q, try lgpu.LinearGpu.prepareBf16(w_buf, @as(usize, split2) * k * 2, w2, k));
+        var m2 = try packBf16AsAwq(gpu, w_all[@as(usize, split2) * k ..][0 .. @as(usize, w2) * k], w2, k);
         defer m2.deinit();
         try runAwq(gpu, q, m2, xr, null, .{ .buf = y_sep }, rows, w2, prompt, sk_match, .{});
         if (!std.mem.eql(u16, y_sep.slice(u16, @as(usize, rows) * w2), y2_s)) return error.SplitSeparateMismatch;
@@ -430,7 +467,7 @@ fn checkQuantRoundTrip(gpu: *lgpu.LinearGpu, q: mtl.Queue, n: u32, k: u32) !void
         }
     }
     const bf = try lgpu.LinearGpu.prepareBf16(w_buf, 0, n, k);
-    var aw = try gpu.quantizeBf16ToAwq(q, bf);
+    var aw = try packBf16AsAwq(gpu, w_s, n, k);
     defer aw.deinit();
     const y_bf = try gpu.device.buffer(@as(usize, 65) * n * 2, opts);
     defer y_bf.deinit();

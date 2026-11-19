@@ -138,9 +138,8 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     const report = @import("sys").optional_libraries.atBoundary();
     defer report.deinit();
     if (fsr_options.refuse(o, problem)) return null;
-    const yarn_ok = isSenseNova(o.model_type) or std.mem.eql(u8, o.model_type, "qwen3_5") or std.mem.eql(u8, o.model_type, "qwen3_5_moe");
-    if (o.prompt_int8 or (o.rope_yarn != null and !yarn_ok)) {
-        problem.* = if (o.prompt_int8) prompt_int8_refusal else "--rope-yarn: the Metal engine supports YaRN on SenseNova-Loop and Qwen27 only; serve without --rope-yarn";
+    if (o.prompt_int8 or (o.rope_yarn != null and !isSenseNova(o.model_type))) {
+        problem.* = if (o.prompt_int8) prompt_int8_refusal else "--rope-yarn: the Metal engine has no YaRN rope; serve without --rope-yarn";
         return null;
     }
     if (std.mem.eql(u8, o.model_type, "fish_omni")) return @import("drama_open.zig").openMetal(a, gpa, io, o, problem);
@@ -313,18 +312,22 @@ fn refusal(a: Allocator, o: api.Open, dense: bool) !?[]const u8 {
     if (o.learn_conversations and (loop_sn or (std.mem.eql(u8, t, "qwen3_5") and dense))) return null;
     const name: []const u8 = if (loop_sn) "SenseNova-Loop" else if (std.mem.eql(u8, t, "glm_moe_dsa")) "GLM-5.3 (EXLR8)" else if (std.mem.eql(u8, t, "lfm2_moe")) "LFM2.5-24B-A2B" else if (isGemma4(t)) "Gemma 4" else if (std.mem.eql(u8, t, "step5_vl")) "Step-5" else if (std.mem.eql(u8, t, "spark2_5")) "Spark-X2.6" else if (std.mem.eql(u8, t, "minimax_m3_vl")) "MiniMax-M3.1-Flash" else if (std.mem.eql(u8, t, "qwen3_5_moe")) "Qwen3.5-MoE" else if (std.mem.eql(u8, t, "llama")) "Llama" else if (std.mem.eql(u8, t, "flint")) "Flint" else if (std.mem.eql(u8, t, "unlimited-ocr")) "Unlimited-OCR-2" else if (!std.mem.eql(u8, t, "qwen3_5")) return null else if (dense) "Qwen3.8-27B" else "Qwen3.5-2B";
     if (o.learn_conversations) return try std.fmt.allocPrint(a, "{s} keeps conversation states on disk for Qwen3.8-27B, Nemotron, Flash Next and GLM-5.3-Flash: serve {s} without it", .{ spill.flag(o), name });
-    const or_talks: []const u8 = if (loop_sn or (dense and std.mem.eql(u8, t, "qwen3_5"))) " (keeps conversation states on disk with --learn-conversations)" else "";
+    const or_talks: []const u8 = if (loop_sn) " (keeps conversation states on disk with --learn-conversations)" else if (dense and std.mem.eql(u8, t, "qwen3_5")) " (Qwen3.8-27B keeps conversation states on disk with --learn-conversations)" else "";
     return try std.fmt.allocPrint(a, "--learn learns prompt prefixes for Nemotron, Flash Next and GLM-5.3-Flash only{s}: serve {s} without --learn, --learn-dir or --learn-gib", .{ or_talks, name });
 }
 
 /// Qwen3.8-27B, Qwen3.5-MoE and SenseNova-Loop-9B on the lane host.
 fn openQwen27(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
+    const sn = isSenseNova(o.model_type);
     const context = o.context orelse 32768;
-    const max_ctx: i64 = if (isSenseNova(o.model_type) or o.rope_yarn != null) 524288 else 262144;
-    if (context <= 0 or context > max_ctx) {
-        problem.* = try std.fmt.allocPrint(a, "--context {d} is outside this Qwen/SenseNova checkpoint's 1 to {d} tokens", .{ context, max_ctx });
+    if (context <= 0 or (!sn and context > 262144)) {
+        problem.* = if (sn)
+            try std.fmt.allocPrint(a, "--context {d} is outside this SenseNova checkpoint's context window", .{context})
+        else
+            try std.fmt.allocPrint(a, "--context {d} is outside this Qwen checkpoint's 1 to 262,144 tokens", .{context});
         return null;
     }
+    if (sn and !try @import("qwen27_engine.zig").senseNovaContextOk(a, io, o.dir, o.rope_yarn, context, problem)) return null;
     if (o.drafts and o.drafter != null and o.drafter_bits != 0 and o.drafter_bits != 4) {
         problem.* = "--drafter-bits takes 0 (bf16) or 4";
         return null;
@@ -332,8 +335,8 @@ fn openQwen27(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
     var why: []const u8 = "";
     const drafter = if (o.drafts) o.drafter else null;
     const learn: ?@import("qwen27_disk.zig").Learn = if (o.learn_conversations) if (o.learn) |root| .{ .root = root, .dir = o.dir, .drafter = drafter, .cap = gibBytes(o.learn_gib), .floor = gibBytes(o.learn_min_free_gib), .daily = gibBytes(o.learn_daily_gib), .spill = o.spill, .slots = spill.slots(o) } else null else null;
-    const h = qwen27.open(gpa, io, o.dir, .{ .context = @intCast(context), .streams = o.lanes, .streams_fixed = o.lanes_fixed, .drafts = o.drafts, .drafter = drafter, .drafter_name = o.drafter_name, .drafter_bits = o.drafter_bits, .cache_gib = o.prompt_cache_gib, .cache_over_cap = o.prompt_cache_over_cap, .decode_share = o.decode_share, .learn = learn, .vision = o.vision, .rope_yarn = o.rope_yarn }, a, &why) catch |err| {
-        problem.* = if (why.len > 0) why else try std.fmt.allocPrint(a, "the native Qwen/SenseNova engine cannot load {s} ({s})", .{ o.dir, @errorName(err) });
+    const h = qwen27.open(gpa, io, o.dir, .{ .context = @intCast(context), .streams = o.lanes, .streams_fixed = o.lanes_fixed, .drafter = drafter, .drafter_name = o.drafter_name, .drafter_bits = o.drafter_bits, .cache_gib = o.prompt_cache_gib, .cache_over_cap = o.prompt_cache_over_cap, .decode_share = o.decode_share, .learn = learn, .vision = o.vision, .rope_yarn = if (sn) o.rope_yarn else null }, a, &why) catch |err| {
+        problem.* = if (why.len > 0) why else try std.fmt.allocPrint(a, "the native {s} engine cannot load {s} ({s})", .{ if (sn) "SenseNova" else "Qwen (27B class)", o.dir, @errorName(err) });
         return null;
     };
     return .{ .engine = h.engine(), .close = qwen27.close, .ctx = h };
@@ -580,4 +583,8 @@ test "plain sharing: Nemotron without a head shares streams without widening its
     try std.testing.expectEqual(@as(u32, 0), config.max_copy);
     try std.testing.expectEqual(@as(u32, 0), config.most_drafts);
     try std.testing.expect(!config.family_mtp);
+}
+
+test "qwen27 rope policy: --rope-yarn and resolved ceiling refusals" {
+    try @import("slide_open_test.zig").qwen27RopeChecks(open);
 }

@@ -175,11 +175,13 @@ pub const Widths = struct {
         var mixed = false;
         for (w.layers) |l| for (l) |x| {
             mixed = mixed or !isUniform(x);
-            h.update(&.{ @backingInt(x.kind), x.bits, @as(u8, @truncate(x.group)), @as(u8, @truncate(x.group >> 8)) });
+            if (x.kind != .affine) h.update(&.{@backingInt(x.kind)});
+            h.update(&.{ x.bits, @as(u8, @truncate(x.group)), @as(u8, @truncate(x.group >> 8)) });
         };
         for ([_]Width{ w.embed, w.head }) |x| {
             mixed = mixed or !isUniform(x);
-            h.update(&.{ @backingInt(x.kind), x.bits, @as(u8, @truncate(x.group)), @as(u8, @truncate(x.group >> 8)) });
+            if (x.kind != .affine) h.update(&.{@backingInt(x.kind)});
+            h.update(&.{ x.bits, @as(u8, @truncate(x.group)), @as(u8, @truncate(x.group >> 8)) });
         }
         return if (mixed) h.final() | 1 else 0;
     }
@@ -489,4 +491,17 @@ test "looped costShape appends cache-busting tag without altering Qwen shapes" {
     c.looped = true;
     try std.testing.expectEqualStrings("64/5120/17408/248320/16/1/sn2", try costShape(c, 0, &buf, 16, true));
     try std.testing.expectEqualStrings("64/5120/17408/248320/16/0/w000000000000002a/sn2", try costShape(c, 0x2a, &buf, 16, false));
+}
+
+test "affine widths tag keeps main's three-byte key while non-affine kinds hash distinctly" {
+    const a = std.testing.allocator;
+    var w = try Widths.uniformAll(a, 1);
+    defer w.deinit();
+    w.layers[0][0] = .{ .bits = 8, .group = 64 };
+    var want_hash = std.hash.Wyhash.init(0x27);
+    for (w.layers) |l| for (l) |x| want_hash.update(&.{ x.bits, @as(u8, @truncate(x.group)), @as(u8, @truncate(x.group >> 8)) });
+    for ([_]Width{ w.embed, w.head }) |x| want_hash.update(&.{ x.bits, @as(u8, @truncate(x.group)), @as(u8, @truncate(x.group >> 8)) });
+    try std.testing.expectEqual(want_hash.final() | 1, w.tag());
+    w.layers[0][0] = .{ .bits = 4, .group = 128, .kind = .awq };
+    try std.testing.expect(w.tag() != (want_hash.final() | 1));
 }

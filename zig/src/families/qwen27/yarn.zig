@@ -61,6 +61,7 @@ fn resolveBlock(block: std.json.ObjectMap, older: bool, theta: f64, max_pos: usi
     const tv = block.get("original_max_position_embeddings") orelse return error.UnsupportedRopeScaling;
     if (tv != .integer or tv.integer < 1 or tv.integer > std.math.maxInt(u32)) return error.UnsupportedRopeScaling;
     const trained: usize = @intCast(tv.integer);
+    if (factor == 1 and trained == max_pos) return applyFlag(theta, max_pos, flag);
     if (!(factor > 1) or @as(f64, @floatFromInt(trained)) * factor != @as(f64, @floatFromInt(max_pos))) return error.UnsupportedRopeScaling;
     if (flag) |f| if (f != factor) return error.RopeYarnConflict;
     if (comptime @hasDecl(core, "rope_yarn")) {

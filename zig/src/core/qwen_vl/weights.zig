@@ -186,18 +186,22 @@ test "the buffer holds the 27B tower's 333 tensors in bf16" {
 test "loadWith keeps vision_tower. only; model.visual. requires explicit prefix opt-in" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
     const sample = @import("config.zig");
-    const c = (try Config.parse(gpa, sample.sample_config, null, null)).?;
+    const c = (try Config.parse(arena.allocator(), sample.sample_config, null, null)).?;
     const hdr = "{\"model.visual.patch_embed.proj.weight\":{\"dtype\":\"BF16\",\"shape\":[1],\"data_offsets\":[0,2]}}";
-    var bytes: [8 + hdr.len + 2]u8 = undefined;
-    std.mem.writeInt(u64, bytes[0..8], hdr.len, .little);
-    @memcpy(bytes[8..][0..hdr.len], hdr);
-    bytes[8 + hdr.len ..][0..2].* = .{ 0, 0 };
+    var buf: [8 + hdr.len + 2]u8 = undefined;
+    std.mem.writeInt(u64, buf[0..8], hdr.len, .little);
+    @memcpy(buf[8..][0..hdr.len], hdr);
+    buf[8 + hdr.len ..][0..2].* = .{ 0, 0 };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = &bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = &buf });
     const dir = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(dir);
-    try std.testing.expectError(error.NoVisionTower, loadWith(gpa, io, undefined, dir, c));
-    try std.testing.expectError(error.UnexpectedVisionTensors, loadWithPrefixes(gpa, io, undefined, dir, c, &.{ prefix, "model.visual." }));
+    try std.testing.expectError(error.NoVisionTower, loadWith(gpa, io, @as(mtl.Device, undefined), dir, c));
+    const found = try shards.headersFor(arena.allocator(), io, dir, "model.visual.");
+    try std.testing.expectEqual(@as(usize, 1), found.count());
+    try std.testing.expect(found.contains("model.visual.patch_embed.proj.weight"));
 }

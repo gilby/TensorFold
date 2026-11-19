@@ -6,6 +6,36 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 - Metal: serve SenseNova-Loop-9B natively in BF16 and AWQ 4-bit (g128) with 56-step two-stream mHC, 512K YaRN and vision (#3859, refs #3781).
 
+- HIP: Qwen 3.5 prices a lone stream's copy windows (suffix matches from the prompt or the reply) from its own timed rounds, so a copy that would cost more than it lands is cut to its best prefix or left off, and keeps those prices across requests; replies are unchanged, and other families opt in through `copy_guard` (#3728, fixes #3390). Thanks to @AbrahamCete.
+
+- DeepSeek-V4.1 on Metal: with `TF_DSV41_PREFILL_PIECES=1`, `TENSORFOLD_PREFILL_ORDER=srpt`, a prompt policy, share or budget, or `--decode-share` set, a prompt runs a chunk at a time between the other streams' rounds, so a short request no longer waits behind a long prompt; with none of them set, prompts run whole as before (#2950, refs #2984). Thanks to @gilby.
+
+- `tensorfold info` on Metal: `tensorfold info MODEL [--context N] [--parallel N|auto]` prints the startup budget `serve` charges a Qwen3.8-27B-class checkpoint (weights, each stream's KV and state, the prompt scratch; no drafter or images) and whether it fits this Mac's Metal working set beside the 8 GiB margin, in place of a memory floor that ignored the context; `info` also copies `model_type` out of the parse before freeing it (#3268, refs #2761). Thanks to @cshintov.
+
+- Nemotron on HIP: a checkpoint whose token table (`backbone.embeddings`) is stored bf16 beside quantized matrices, marked `false` in config.json's quantization block or stored without scales, is admitted and loads; its rows are gathered as stored, the memory plan counts them at their stored bytes, and the startup label adds `+bf16-embed`; a bf16 `lm_head`, projection or other unquantized tensor is still refused by name (#3575, refs #3061). Thanks to @gilby.
+
+- GLM-5.3-Flash on Metal: prompt index scores read each row's queries once per tile and routed-expert gathers load the next step's codes ahead, so follow-up turns reach the first token sooner with unchanged outputs (#3458).
+
+- Web: an explicit relative `--token-file` path for the service installer is anchored to the directory it is run from, so the file the installer prepares and the file the generated launcher opens are the same; the default path and symlink handling are unchanged (#3838, fixes #3835). Thanks to @AIFlowML.
+
+- Tests: `test-pull-host` no longer hangs on macOS, where the test allocator's stack capture on frees from the client's I/O threads deadlocked in Zig's Mach-O unwinder (#3740).
+
+- Tests: a new host step, `test-hip-followers-host`, runs the HIP followers' step-parser tests (the `hip_serve` protocol tests and the Flash Next, Qwen and Nemotron HIP worker security tests) in CI, where no build step ran them (#3091).
+
+- Kernel contract: the nvcc 13.2/13.3 usage table moves to its own registry_cuda_sets.zig, so registry.zig has room under the 600-line limit; the registered set is unchanged (#3865).
+
+- Tools: `tools/draft_divergence.py` checks drafted decoding returns exactly the plain token IDs on prompts around recorded BF16 near-ties, at draft caps 1, 4 and 8 (#3841).
+
+- Tests: a two-session KV isolation test pins that kept states across spill, offload and page reuse match by tokens only, never position (#3840).
+
+- CI: the last four host checks excluded under #2031 return to the aggregate; recording fixtures initialize runner state and affine kernel handles.
+
+- Server: `GET /v1/models/{id}` (and `/models/{id}`) returns the entry `/v1/models` lists for the served name or an alias, the id sent as written or percent-escaped (`org%2Fname`); any other id is a 404 `model_not_found`, and API keys and key scopes treat the route as they treat `/v1/models` (#3535).
+
+- CUDA and HIP: Qwen 3.5 settings go through the environment rules, so malformed text is refused at startup with the setting's name and accepted forms; names, defaults and clamps are unchanged (#3520).
+
+- Qwen3.8-27B on Metal: tensor-unit qk projections, flat glue kernels and Metal 4 verify passes each have their own off switch (`TF_Q27_QK=0`, `TF_Q27_FLAT_GLUE=0`, `TF_Q27_METAL4=0`) and are bit-identical to the kernels they replace; qk and Metal 4 stay off on chips without tensor units (#2342).
+
 - Tools: the served gates (`tools/conformance.py`, the Qwen and LFM3 serve checks and the Qwen3.8-27B HTTP gate) prove they ran what they claim: drafts landed, the sampler and the prompt cache were used, and concurrent requests overlapped (#3708, follows #2460). Thanks to @jschmied.
 
 - GLM on CUDA: a decode window's EXL3 routed experts launch on the 16-pair item plan instead of the group kernel's grid of mostly idle blocks, with the same output bytes (#2044). Thanks to @BadAd84.

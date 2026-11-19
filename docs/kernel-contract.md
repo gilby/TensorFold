@@ -177,6 +177,9 @@ The HIP relu^2 replacement retains every non-finite plant and checks both unfuse
 independent float64 output class. No inherited infinity discrepancy is accepted.
 The paired launch retains every table plant and checks both members' separate-launch bytes and every
 float64 output class, without an inherited exception.
+Its 1x8 tile at 5, 6 and 8 bits takes 256 VGPRs and spills to scratch on gfx1100, a gate-5 finding: limits do not count
+scratch, so `spills_on_gfx1100` in `hip_records_relu2_widths.zig` names those three records, and its test fails when a
+record spills that the list does not name or a named one stops spilling.
 
 ## Isolated masked-value panels
 
@@ -406,6 +409,36 @@ GLM's Metal window projections register narrow and wide rows at 2, 3, 4, 5, 6 an
 Independent FP64 linear cases accompany byte replacements against frozen pre-window-optimization kernels.
 The gathered SwiGLU keeps its predecessor's clipped BF16 output and nonfinite rules; gate/up taps qualify its dots separately.
 Controls dispatch real source mutations that couple rows or select the wrong expert; host tests validate their witnesses.
+GLM-5.3-Flash's other served Metal launches (`metal_glm_launch.zig`, names `metal glm launch ...`) each run the loader's
+own library text beside the kernel they replace, on the same inputs, and must give its bytes in every written buffer,
+untouched guards and poisoned padding included. The decode select's merge (rows within 3,072 blocks) and its mark and
+merge (past 8,192 blocks, to rows past 65,536 blocks where the merge falls back to the whole row) keep
+`glm_index_select`'s key lists over ties, signed zeros, NaNs, infinities and a floor that overshoots. The windowed KDA
+step (`glm_kda_window`, 64 heads, and `glm_kda_window_tp`, 32) keeps `kda_rows`' outputs, next state and next conv
+window at 2 to 16 rows. A window's dense attention as `attendRows` launches it (`glm_latent_scores_rows`,
+`glm_softmax_rows`, `glm_latent_values_rows`) keeps main's one-row launches' scores, probabilities and outputs row by
+row, 1 to 2,048 keys across the 256-key join and the 1,024-key split, against a frozen copy of main's `glm_attn.metal`.
+The hyper-connection boundary as `core/hc.zig` launches it (the expand's parts on six groups a slice to 4 rows) keeps
+main's expand and split (a frozen `hc_boundary.metal`) in the streams, partial sums, normed row, post and comb, as raw
+words, for separate streams, in place and at a first read. The decode experts at `moe.zig`'s outputs a simdgroup keep
+the four-output gate/up and down kernels' activations and outputs. On an Ultra's GPU the KDA step's two groups a head
+with the norm after (`glm_kda_parts`, `glm_kda_norm`) keep `kda_rows`' bytes at 2 to 16 rows. The boundary's two-group
+split runs in the same boundary entries, and the attention entry runs the prefetched score and value bodies with a
+control that multiplies the prefetched block. The one-row router and indexer-gate logits (`glm_route_logits_one`, fp32
+and bf16 out) also meet float64 at every gate, each row its own one-row launch, and give `tf_route_logits`' bits. The
+core route select (`tf_route_select`, its picks by simd max and min and its groups' offsets by prefix sums) keeps main's
+picks, weights, held groups, pick lists and counts at GLM's shape (every expert held, or either half) and Step-5's, over
+ties, NaNs, signed zeros and -inf biases. `glm_mla_norms` (three roles, and four with the query norm) keeps main's
+`glm_rms`, `glm_layer_norm` and `glm_scale` launches; the attention entry's scores kernel scales the queries by 1/16 as
+it loads them, against main's `glm_scale` first. The boundary that combines a MoE block's picks (`tf_hc_expand_mix_moe`,
+and its parts to 2 rows) keeps main's combine then expand, and a one-row MoE layer whose gate/up groups replay the
+select keeps main's select then the one-row gathers (its picks held to the 16 experts given weights by -inf biases
+elsewhere). A prompt chunk's routed experts and deep dense products in column groups (`glm_gather_glu_32`/`_64`,
+`glm_gather_scatter_32`/`_64`, `glm_mm_grouped`) keep `core/affine_mm.metal`'s one-launch gathers and `tf_affine_mm` at
+both gather heights, with a partial last column group in the dense entry. Gate 1 plants NaN and both infinities and
+requires the predecessor's bytes, NaN payloads included; these
+entries compare and keep sums rather than requalify them, so gate 4 does not apply. Each has a control, a planted source
+fault red at `shapes`, and its launches are in `glm_launch_records.zig`.
 CUDA also checks LFM2.5-24B-A2B's kernels: the router's fp32 logits (`tf_lfm2m_route`) and its top-4 rule, Liquid's
 3-tap short conv with its per-row state snapshots and the state commit (`liquid_conv.cuh`), each against the host's
 replay of its fp32 and bf16 steps (three controls: ties to the higher expert, bx unrounded, every stream committing into

@@ -8,6 +8,7 @@ const lanes = tf.lanes;
 const nemotron = tf.nemotron;
 const Allocator = std.mem.Allocator;
 const qwen27 = @import("qwen27_served.zig");
+const q27_eng = @import("qwen27_engine.zig");
 const flashnext = @import("flashnext_host.zig");
 const glm = @import("glm_host.zig");
 const glm_dsa = @import("glm_dsa_host.zig");
@@ -77,10 +78,6 @@ fn isGemma4(model_type: []const u8) bool {
     return std.mem.eql(u8, model_type, "gemma4") or std.mem.eql(u8, model_type, "gemma4_unified");
 }
 
-fn isSenseNova(model_type: []const u8) bool {
-    return std.mem.eql(u8, model_type, "sensenova_loop");
-}
-
 /// The host's memory counts: `cache_fit.hostMemory` from the process footprint (no configured load limit).
 fn readMemory(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
     return cache_fit.hostMemory(0, reset_peak);
@@ -138,7 +135,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     const report = @import("sys").optional_libraries.atBoundary();
     defer report.deinit();
     if (fsr_options.refuse(o, problem)) return null;
-    if (o.prompt_int8 or (o.rope_yarn != null and !isSenseNova(o.model_type))) {
+    if (o.prompt_int8 or (o.rope_yarn != null and !q27_eng.isSenseNova(o.model_type))) {
         problem.* = if (o.prompt_int8) prompt_int8_refusal else "--rope-yarn: the Metal engine has no YaRN rope; serve without --rope-yarn";
         return null;
     }
@@ -152,7 +149,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         return @import("kimi_metal.zig").open(a, gpa, io, o, problem);
     if (std.mem.eql(u8, o.model_type, "qwen4") or std.mem.eql(u8, o.model_type, "qwen4_text")) return @import("qwen4_metal.zig").open(a, gpa, io, o, problem);
     if (std.mem.eql(u8, o.model_type, "qwen3")) return @import("qwen3_metal.zig").open(a, gpa, io, o, problem);
-    const dense = isSenseNova(o.model_type) or (std.mem.eql(u8, o.model_type, "qwen3_5") and @import("qwen27_engine.zig").owns(a, io, o.dir)) or std.mem.eql(u8, o.model_type, "qwen3_5_moe");
+    const dense = q27_eng.isSenseNova(o.model_type) or q27_eng.ownsQwen27(a, io, o.model_type, o.dir);
     if (try refusal(a, o, dense)) |why| {
         problem.* = why;
         return null;
@@ -298,7 +295,7 @@ const recall_refusal = "--recall drafts from a record in the lane engine's round
 /// Refused before any weights load: absent family learners and unsupported disk-state options.
 fn refusal(a: Allocator, o: api.Open, dense: bool) !?[]const u8 {
     const t = o.model_type;
-    const loop_sn = isSenseNova(t);
+    const loop_sn = q27_eng.isSenseNova(t);
     if (o.kv8) return "--kv-cache fp8 keeps fp8 caches on CUDA; the Metal engines keep bf16: serve without it";
     if (o.prompt_int8) return prompt_int8_refusal;
     if (!learners.supports(t)) if (try o.slideRefusal(a, "Macs")) |why| return why;
@@ -316,18 +313,21 @@ fn refusal(a: Allocator, o: api.Open, dense: bool) !?[]const u8 {
     return try std.fmt.allocPrint(a, "--learn learns prompt prefixes for Nemotron, Flash Next and GLM-5.3-Flash only{s}: serve {s} without --learn, --learn-dir or --learn-gib", .{ or_talks, name });
 }
 
+pub const Qwen27Budget = @import("qwen27_reserve.zig").Budget;
+/// What a Qwen3.8-27B-class start keeps free of its working set.
+pub const qwen27_margin = tf.qwen27.prompt_memory.margin;
+
+/// `serve`'s startup charge for a Qwen3.8-27B-class `dir` (no drafter or images); null for others or a refused context.
+pub fn qwen27Budget(a: Allocator, io: std.Io, t: []const u8, dir: []const u8, weights: u64, context: ?i64, streams: u32, fixed: bool, problem: *[]const u8) !?Qwen27Budget {
+    if (!q27_eng.ownsQwen27(a, io, t, dir)) return null;
+    const n = try q27_eng.qwen27Context(a, context, problem) orelse return null;
+    return try @import("qwen27_reserve.zig").budget(a, io, dir, weights, n, streams, fixed);
+}
+
 /// Qwen3.8-27B, Qwen3.5-MoE and SenseNova-Loop-9B on the lane host.
 fn openQwen27(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
-    const sn = isSenseNova(o.model_type);
-    const context = o.context orelse 32768;
-    if (context <= 0 or (!sn and context > 262144)) {
-        problem.* = if (sn)
-            try std.fmt.allocPrint(a, "--context {d} is outside this SenseNova checkpoint's context window", .{context})
-        else
-            try std.fmt.allocPrint(a, "--context {d} is outside this Qwen checkpoint's 1 to 262,144 tokens", .{context});
-        return null;
-    }
-    if (sn and !try @import("qwen27_engine.zig").senseNovaContextOk(a, io, o.dir, o.rope_yarn, context, problem)) return null;
+    const sn = q27_eng.isSenseNova(o.model_type);
+    const context = try q27_eng.laneContext(a, io, sn, o.dir, o.rope_yarn, o.context, problem) orelse return null;
     if (o.drafts and o.drafter != null and o.drafter_bits != 0 and o.drafter_bits != 4) {
         problem.* = "--drafter-bits takes 0 (bf16) or 4";
         return null;

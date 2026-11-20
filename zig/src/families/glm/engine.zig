@@ -224,6 +224,7 @@ pub const Engine = struct {
             gpa.destroy(e.w);
         }
         if (!wts.native(e.w, &e.c)) try e.k.widen(gpa, e.device); // a width, split stack or layout past the 4/64 kernels
+        try @import("draft_head_q4.zig").maybeMake(gpa, e.device, e.w, &e.c, e.w.bytes + e.arena.bytes + tower, limit);
         try e.prepare();
         if (link) |s| {
             const rows = e.c.byRows();

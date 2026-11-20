@@ -54,4 +54,5 @@ test {
     _ = vision;
     _ = image;
     _ = video;
+    _ = @import("draft_head_q4.zig");
 }
